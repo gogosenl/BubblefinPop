@@ -1,0 +1,30 @@
+# Dependencies and Expo local state are restored by EAS Build.
+node_modules/
+.expo/
+.git/
+
+# Local build products and temporary working files.
+dist/
+dist-*/
+work/
+outputs/
+
+# Store screenshots, handoff archives, and generated binaries are not app sources.
+*.zip
+*.ipa
+*.apk
+*.aab
+
+# Local logs and signing credentials must never be uploaded.
+npm-debug.log*
+*.jks
+*.p8
+*.p12
+*.key
+*.mobileprovision
+
+# OS/editor metadata.
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

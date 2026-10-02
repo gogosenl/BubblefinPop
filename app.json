@@ -1,0 +1,63 @@
+{
+  "expo": {
+    "name": "Bubblefin Pop",
+    "slug": "bubblefin-pop",
+    "version": "1.0.0",
+    "description": "Merge colorful water bubbles, pop them, and free every pufferfish.",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "scheme": "bubblefinpop",
+    "icon": "./assets/app-icon-pufferfish-v3.png",
+    "assetBundlePatterns": [
+      "assets/**/*"
+    ],
+    "splash": {
+      "image": "./assets/home-hero-pufferfish-v3.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0799C8"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.gorsengames.bubblefinpop",
+      "buildNumber": "1",
+      "icon": "./assets/app-icon-pufferfish-v3.png",
+      "requireFullScreen": true,
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.gorsengames.bubblefinpop",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/home-hero-pufferfish-v3.png",
+        "backgroundColor": "#0799C8"
+      },
+      "permissions": [
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ]
+    },
+    "updates": {
+      "fallbackToCacheTimeout": 0
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "plugins": [
+      [
+        "expo-audio",
+        {
+          "microphonePermission": false,
+          "recordAudioAndroid": false,
+          "enableBackgroundPlayback": false,
+          "enableBackgroundRecording": false
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "4b13097d-228d-4e6e-9b57-0fc112363e52"
+      }
+    },
+    "owner": "gorkemsenol"
+  }
+}
