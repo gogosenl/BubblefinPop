@@ -1,61 +1,128 @@
 # Bubblefin Pop
 
-Renkli su balonlarını birleştirip balon balıklarını özgür bıraktığın, Expo ve React Native ile geliştirilmiş portre mobil bulmaca oyunu.
+<p align="center">
+  <img src="./assets/app-icon-pufferfish-v3.png" width="132" alt="Bubblefin Pop app icon" />
+</p>
 
-## Oyun deneyimi
+<p align="center">
+  A polished portrait puzzle game about dropping water bubbles, merging matching pufferfish, and freeing complete schools.
+</p>
 
-- Profesyonel ana ekran, bölüm haritası ve ayarlar ekranı
-- Bubblefin Pop ve Görsen Games markalı animasyonlu açılış; gerçek dosya yüklenmesini izleyen yüzde göstergeli ilerleme çubuğu
-- Animasyonlu bölüm kartları, tamamlanma madalyaları ve özel tebrik ekranı
-- 16 dünyaya ayrılmış 800 oynanabilir bölüm; her dünyada 50 bölüm
-- İlk üç bölümde renkleri ve birleştirmeyi adım adım öğreten etkileşimli alıştırmalar
-- Türkçe ve İngilizce arayüz
-- Ayrı ayrı açılıp kapatılabilen su altı fon müziği ve su balonu hissi veren düşüş, birleşme ve patlama efektleri
-- Adil renk torbası sayesinde sekizden fazla balon boyunca eksik renk bekletmeyen bölüm sistemi
-- Dil, müzik ve bölüm ilerlemesini cihazda otomatik kaydetme
+<p align="center">
+  <strong>React Native · Expo · TypeScript · iOS & Android</strong>
+</p>
 
-## Expo Go ile test
+## Overview
 
-PowerShell betik kısıtlamasına ve Expo oturum sunucusu hatalarına takılmamak için proje klasöründe çevrimdışı Metro modunu kullan:
+Bubblefin Pop is a mobile physics-puzzle game developed under the Görsen Games label. Players drag a bubble across the launcher, release it into a water-filled arena, and create same-color chains. Completed bubbles burst while their pufferfish swim toward the rescue counter.
+
+The project focuses on tactile interaction, readable color sorting, stable custom physics, fluid animation, and short mobile-friendly levels. It contains 100 levels across five themed worlds, including three guided onboarding stages.
+
+<p align="center">
+  <img src="./assets/home-hero-pufferfish-v3.png" width="420" alt="Bubblefin Pop pufferfish artwork" />
+</p>
+
+## Highlights
+
+- Touch-anywhere launcher with direct drag control and a visible next-bubble preview
+- Immediate same-color merging, parallel merge groups, chain reactions, and animated rescue flights
+- Variable-size bubbles whose diameter reflects the number of pufferfish inside
+- Square, curved, cave, and drop-shaped arenas with route-validated layouts
+- Ramps, clams, anchors, pistons, ship wheels, hatches, breakable crates, streams, and vortices
+- Optional obstacle missions, combo progression, rainbow bubbles, and heavy impact bubbles
+- 100 paced levels with a fair color-bag system and locally saved progress
+- Turkish and English interfaces
+- Independent music and sound-effect controls
+- Animated startup preload flow to prevent late-loading UI assets
+
+## Engineering notes
+
+The gameplay simulation is implemented without a third-party physics engine. A fixed-step solver handles gravity, circle contacts, curved floors, obstacle collisions, sleeping/waking, support loss, and collision separation. Rendering uses persistent animated values so ordinary physics frames do not rebuild every bubble and fish component.
+
+The merge pipeline is serialized separately from falling physics. This prevents a new drop from entering while a merge is being resolved, while still allowing input to return before decorative rescue animations finish. Development-time guards verify:
+
+- mixed-color fish never move into the wrong bubble;
+- independent matching groups can merge in parallel;
+- high-speed matching impacts are not missed;
+- sleeping stacks remain stable and non-overlapping;
+- every generated obstacle layout retains a full-size playable route;
+- all level goals remain mathematically reachable.
+
+## Tech stack
+
+| Area | Technology |
+| --- | --- |
+| Application | React Native 0.86, React 19, TypeScript 6 |
+| Tooling | Expo SDK 57, EAS Build |
+| Animation | React Native Animated with native-driver transitions |
+| Audio | Expo Audio |
+| Persistence | AsyncStorage |
+| Platforms | iOS and Android |
+
+The repository intentionally does not include a web target.
+
+## Run locally
+
+Requirements:
+
+- Node.js 20 or newer
+- Expo Go on an iOS or Android device
 
 ```powershell
+npm install
+npm start -- --clear
+```
+
+Scan the QR code with Expo Go. On Windows PowerShell systems that block `npm.ps1`, use:
+
+```powershell
+npm.cmd install
 npm.cmd start -- --clear
 ```
 
-Expo Go ile terminaldeki QR kodu okut.
-
-Android emülatörünü doğrudan açmak için:
+Android emulator shortcut:
 
 ```powershell
 npm.cmd run android -- --clear
 ```
 
-Bu komut Expo'nun çevrim içi geliştirme oturumu servisini kullanmaz; oyun ve QR bağlantısı yerel ağda çalışmaya devam eder.
+## Quality checks
 
-## Kontroller
+Run the complete local verification suite:
 
-- Oyun alanında basılı tut; balonu sağa-sola sürükleyerek hizala ve düşürmek için parmağını bırak.
-- Fırlatma alanının sağındaki küçük balon, bir sonraki rengi önceden gösterir; mevcut balon bırakılınca yuvarlanarak fırlatma konumuna gelir.
-- Aynı renkteki balonlar temas ettikleri anda birleşir.
-- Balon balığı sayısı arttıkça balon büyür.
-- Hedef sayıya ulaşan tek renkli balon patlar ve balon balıkları özgür kalır.
+```powershell
+npm.cmd run check
+```
 
-## iOS üretim kontrolü
+Or run checks separately:
 
 ```powershell
 npm.cmd run typecheck
 npm.cmd run audit:levels
+npm.cmd run audit:runtime
 npm.cmd run audit:audio
-npx.cmd expo export --platform ios --clear
+npm.cmd run audit:public
 ```
 
-## App Store derlemesi
+`audit:public` checks tracked files for credentials, private keys, build archives, personal absolute paths, and oversized files before the repository is made public.
 
-Apple Developer ve Expo hesapları bağlandıktan sonra:
+## Production build
 
 ```powershell
-npx.cmd eas-cli build --platform ios --profile production
-npx.cmd eas-cli submit --platform ios --profile production
+npx.cmd eas-cli@latest build --platform ios --profile production
+npx.cmd eas-cli@latest build --platform android --profile production
 ```
 
-Yayın öncesinde App Store Connect içinde ekran görüntüleri, yaş derecelendirmesi, destek ve gizlilik politikası bağlantıları ayrıca doldurulmalıdır.
+The repository excludes signing credentials, provisioning profiles, local Expo state, build artifacts, store archives, and environment files.
+
+## Privacy
+
+The current game has no account system, advertising SDK, analytics SDK, backend API, or network gameplay. Language, audio preferences, current level, and progress are stored locally on the device.
+
+## Türkçe özet
+
+Bubblefin Pop; su balonlarını bırakarak aynı renkteki balon balıklarını birleştirdiğin, engelleri ve akıntıları yönettiğin mobil bir fizik-bulmaca oyunudur. Projede özel fizik çözümü, eş zamanlı renk birleşmeleri, zincir reaksiyonları, 100 bölüm, Türkçe/İngilizce arayüz, yerel kayıt sistemi ve iOS/Android üretim yapılandırması bulunur.
+
+## Rights
+
+Source code and original game assets are © 2026 Görsen Games. They are published here for portfolio review. No signing credentials or store secrets are included.

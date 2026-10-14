@@ -22,6 +22,7 @@ type Screen = 'home' | 'levels' | 'game' | 'settings';
 type Language = 'tr' | 'en';
 type GameState = 'playing' | 'won' | 'lost';
 type AudioCue = 'drop' | 'merge' | 'pop';
+type BubblePower = 'rainbow' | 'heavy';
 type RescueFlightSpec = {
   id: string;
   type: CreatureType;
@@ -91,9 +92,19 @@ type Piece = {
   sleeping?: boolean;
   settleFrames?: number;
   contactFrames?: number;
+  power?: BubblePower;
 };
 
-type NextBubble = { id: string; type: CreatureType; count: number; contents: CreatureType[] };
+type NextBubble = { id: string; type: CreatureType; count: number; contents: CreatureType[]; power?: BubblePower };
+
+type PilotMission = {
+  obstacle?: ObstacleVisualKind;
+  kind: 'hit' | 'vortex' | 'break';
+  target: number;
+  reward: BubblePower;
+  tr: string;
+  en: string;
+};
 
 type Level = {
   id: number;
@@ -120,15 +131,52 @@ const BOARD_HEIGHT = Math.max(430, Math.floor(SCREEN_HEIGHT - 188));
 const CELL = Math.floor(Math.min(BOARD_WIDTH / COLS, 72));
 const BUBBLE_SIZE = CELL + 11;
 const BOARD_WALL_INSET = 30;
+const ROUND_FRAME_INNER_EDGE_RATIO = 219 / 1024;
+const roundFrameOverflowForWidth = (width: number) =>
+  (ROUND_FRAME_INNER_EDGE_RATIO * width - BOARD_WALL_INSET)
+  / (1 - ROUND_FRAME_INNER_EDGE_RATIO * 2);
+// Crop the wide source frame farther outside the board so its straight inner
+// rails align with the same full-width play area as square levels.
+const ROUND_FRAME_HORIZONTAL_OVERFLOW = roundFrameOverflowForWidth(BOARD_WIDTH);
+const ROUND_FRAME_SOURCE_CURVE_RATIO = 1054 / 1536;
+const ROUND_FRAME_SOURCE_BOTTOM_RATIO = 1334 / 1536;
+const ROUND_FRAME_TARGET_CURVE_RATIO = 0.73;
+const ROUND_FRAME_TARGET_BOTTOM_RATIO = 0.99;
+const ROUND_FRAME_VERTICAL_SCALE = (
+  ROUND_FRAME_TARGET_BOTTOM_RATIO - ROUND_FRAME_TARGET_CURVE_RATIO
+) / (
+  ROUND_FRAME_SOURCE_BOTTOM_RATIO - ROUND_FRAME_SOURCE_CURVE_RATIO
+);
+const ROUND_FRAME_TOP_RATIO = ROUND_FRAME_TARGET_CURVE_RATIO
+  - ROUND_FRAME_VERTICAL_SCALE * ROUND_FRAME_SOURCE_CURVE_RATIO;
+const ROUND_FRAME_TOP_OFFSET = Math.round(BOARD_HEIGHT * ROUND_FRAME_TOP_RATIO);
+const ROUND_FRAME_BOTTOM_EXTENSION = Math.round(
+  BOARD_HEIGHT * (ROUND_FRAME_TOP_RATIO + ROUND_FRAME_VERTICAL_SCALE - 1),
+);
+const ROUND_FRAME_CURVE_START_Y = BOARD_HEIGHT * ROUND_FRAME_TARGET_CURVE_RATIO;
+const ROUND_FRAME_INNER_BOTTOM_Y = BOARD_HEIGHT * ROUND_FRAME_TARGET_BOTTOM_RATIO;
+const ROUND_PLAYFIELD_INSET = BOARD_WALL_INSET;
+const ROUND_SIDE_FRAME_CLEARANCE = 1.5;
+const STANDARD_SIDE_FRAME_CLEARANCE = 0.75;
+const FLOOR_FRAME_CLEARANCE = 0.75;
 const HELD_BUBBLE_TOP = 8;
 const FAIL_LINE_Y = 58;
 const FAIL_LINE_WARNING_MS = 720;
 const FLOOR_CLEARANCE = 47;
-const BUBBLE_GAP = 0.75;
-const MERGE_ANIMATION_MS = 560;
+// A sub-pixel cushion keeps anti-aliased outlines tangent without leaving a
+// visible gap between neighbouring bubbles.
+const BUBBLE_GAP = 0.25;
+const CONTACT_SLOP = 0.02;
+// Settled bubbles need a slightly wider numerical dead zone. It still leaves
+// their visible circles separated (the value is smaller than BUBBLE_GAP), but
+// prevents the pair solver from moving an entire resting pile back and forth
+// by fractions of a pixel on every frame of a moving-obstacle level.
+const RESTING_CONTACT_SLOP = 0.16;
+const POSITION_SOLVER_PASSES = 10;
+const MERGE_ANIMATION_MS = 520;
 const MERGE_SETTLE_HOLD_MS = 0;
-const POP_ANIMATION_MS = 1750;
-const RESCUE_FLIGHT_MS = 2450;
+const POP_ANIMATION_MS = 1250;
+const RESCUE_FLIGHT_MS = 1850;
 const RESCUE_SCORE_COMMIT_MS = RESCUE_FLIGHT_MS - 35;
 const collisionDistanceFor = (a: Pick<Piece, 'size'>, b: Pick<Piece, 'size'>) =>
   (a.size + b.size) / 2 + BUBBLE_GAP;
@@ -137,6 +185,25 @@ const bubbleSizeForCount = (count: number) => Math.round(
 );
 
 type ObstacleKind = 'coral' | 'stone' | 'pearl';
+type ObstacleVisualKind = 'ramp' | 'clam' | 'anchor' | 'piston' | 'wheel' | 'flap' | 'crate';
+type ArenaShape = 'square' | 'round' | 'drop' | 'cave';
+type ObstacleMotion = {
+  type: 'rotate' | 'slide' | 'seesaw' | 'orbit';
+  speed: number;
+  range: number;
+  phase?: number;
+};
+type BoardCurrent = {
+  id: string;
+  kind: 'stream' | 'vortex';
+  cx: number;
+  cy: number;
+  width: number;
+  height: number;
+  strength: number;
+  angle?: number;
+  clockwise?: boolean;
+};
 type BoardObstacle = {
   id: string;
   cx: number;
@@ -145,15 +212,31 @@ type BoardObstacle = {
   thickness: number;
   angle: number;
   kind: ObstacleKind;
+  role?: 'obstacle' | 'boundary';
+  motion?: ObstacleMotion;
+  reaction?: 'solid' | 'spring';
+  velocityX?: number;
+  velocityY?: number;
+  angularVelocity?: number;
+  visual?: ObstacleVisualKind;
+  breakHits?: number;
 };
 type BoardLayout = {
+  arenaShape: ArenaShape;
   floorSlope: number;
+  floorCurve: number;
   obstacles: BoardObstacle[];
+  currents: BoardCurrent[];
   water: string;
   depth: string;
   rail: string;
   floor: string;
   floorEdge: string;
+};
+type ObstacleVisualState = {
+  offset: Animated.ValueXY;
+  rotation: Animated.Value;
+  reaction: Animated.Value;
 };
 
 const BOARD_THEMES = [
@@ -164,68 +247,674 @@ const BOARD_THEMES = [
   { water: '#e9efff', depth: 'rgba(113,118,209,0.18)', rail: '#655fc5', floor: '#afcfd1', floorEdge: '#779fae' },
   { water: '#d9f5ff', depth: 'rgba(53,163,218,0.23)', rail: '#2665b6', floor: '#8bd7cf', floorEdge: '#4daeb0' },
 ] as const;
+
+const BOARD_PATTERN_COUNT = 24;
+
+type BoardPattern = Pick<BoardLayout, 'arenaShape' | 'floorSlope' | 'floorCurve' | 'obstacles'> & {
+  currents?: BoardCurrent[];
+};
+
+function showcasePatternForLevel(levelId: number, w: number, h: number): BoardPattern | undefined {
+  if (levelId < 4 || levelId > 20) return undefined;
+  const ramp = (id: string, cx = w * 0.5, cy = h * 0.53, angle = -12): BoardObstacle => ({
+    id, cx, cy, length: Math.min(90, w * 0.25), thickness: 36, angle,
+    kind: 'pearl', visual: 'ramp',
+  });
+  const clam = (id: string, cx = w * 0.5, cy = h * 0.5): BoardObstacle => ({
+    id, cx, cy, length: 58, thickness: 58, angle: 0,
+    kind: 'coral', visual: 'clam', reaction: 'spring',
+  });
+  const anchor = (id: string, cx = w * 0.5, cy = h * 0.43): BoardObstacle => ({
+    id, cx, cy, length: 86, thickness: 36, angle: 0,
+    kind: 'stone', visual: 'anchor',
+    motion: { type: 'seesaw', speed: 0.52, range: 24 },
+  });
+  const piston = (id: string, side: 'left' | 'right', cy = h * 0.48): BoardObstacle => ({
+    id,
+    cx: side === 'left' ? BOARD_WALL_INSET + 62 : w - BOARD_WALL_INSET - 62,
+    cy,
+    length: 104,
+    thickness: 42,
+    angle: side === 'left' ? 0 : 180,
+    kind: 'coral',
+    visual: 'piston',
+    role: 'boundary',
+    motion: { type: 'slide', speed: side === 'left' ? 0.66 : -0.66, range: 18, phase: side === 'left' ? 0 : Math.PI },
+  });
+  const wheel = (id: string, cx = w * 0.5, cy = h * 0.47): BoardObstacle => ({
+    id, cx, cy, length: 78, thickness: 78, angle: 0,
+    kind: 'stone', visual: 'wheel', reaction: 'spring',
+    // The detailed spokes are visual. A single circular collider prevents the
+    // overlapping-arm jitter that compound rotating bodies produced.
+    motion: { type: 'rotate', speed: 17, range: 0 },
+  });
+  const flap = (id: string, cx = w * 0.5, cy = h * 0.52, angle = -8): BoardObstacle => ({
+    id, cx, cy, length: 88, thickness: 32, angle,
+    kind: 'pearl', visual: 'flap', reaction: 'spring',
+    motion: { type: 'seesaw', speed: 0.44, range: 11 },
+  });
+  const crate = (id: string, cx = w * 0.5, cy = h * 0.52): BoardObstacle => ({
+    id, cx, cy, length: 62, thickness: 62, angle: 0,
+    kind: 'pearl', visual: 'crate', breakHits: 2,
+  });
+  const vortex = (id: string, cx = w * 0.5, cy = h * 0.42): BoardCurrent => ({
+    id, kind: 'vortex', cx, cy, width: Math.min(190, w * 0.54), height: 180,
+    strength: 0.2, clockwise: true,
+  });
+
+  const layouts: Record<number, BoardPattern> = {
+    4: { arenaShape: 'square', floorSlope: 0, floorCurve: 0, obstacles: [ramp('showcase-ramp')] },
+    5: { arenaShape: 'square', floorSlope: 0, floorCurve: 0, obstacles: [clam('showcase-clam')] },
+    6: { arenaShape: 'round', floorSlope: 0, floorCurve: 72, obstacles: [anchor('showcase-anchor')] },
+    7: { arenaShape: 'square', floorSlope: 0, floorCurve: 0, obstacles: [piston('showcase-piston', 'left')] },
+    8: { arenaShape: 'cave', floorSlope: 0, floorCurve: 0, obstacles: [wheel('showcase-wheel')] },
+    9: { arenaShape: 'square', floorSlope: 0, floorCurve: 0, obstacles: [], currents: [vortex('showcase-vortex')] },
+    10: { arenaShape: 'drop', floorSlope: 0, floorCurve: 14, obstacles: [flap('showcase-flap')] },
+    11: { arenaShape: 'square', floorSlope: 0, floorCurve: 0, obstacles: [crate('showcase-crate')] },
+    12: { arenaShape: 'square', floorSlope: 7, floorCurve: 0, obstacles: [ramp('combo-ramp', w * 0.4, h * 0.68, -10), clam('combo-clam', w * 0.74, h * 0.34)] },
+    13: { arenaShape: 'cave', floorSlope: 0, floorCurve: 0, obstacles: [anchor('combo-anchor', w * 0.62, h * 0.38), piston('combo-piston', 'left', h * 0.59)] },
+    14: { arenaShape: 'square', floorSlope: 0, floorCurve: 0, obstacles: [wheel('combo-wheel', w * 0.68, h * 0.54)], currents: [vortex('combo-vortex', w * 0.29, h * 0.34)] },
+    15: { arenaShape: 'round', floorSlope: 0, floorCurve: 72, obstacles: [flap('combo-flap', w * 0.64, h * 0.35, 8), crate('combo-crate', w * 0.25, h * 0.55)] },
+    16: { arenaShape: 'square', floorSlope: -6, floorCurve: 0, obstacles: [ramp('mix-ramp', w * 0.62, h * 0.61, -14), anchor('mix-anchor', w * 0.33, h * 0.36)] },
+    17: { arenaShape: 'drop', floorSlope: 0, floorCurve: 14, obstacles: [clam('mix-clam', w * 0.7, h * 0.6), piston('mix-piston', 'left', h * 0.42)] },
+    18: { arenaShape: 'cave', floorSlope: 0, floorCurve: 0, obstacles: [wheel('mix-wheel', w * 0.31, h * 0.6), crate('mix-crate', w * 0.76, h * 0.3)] },
+    19: { arenaShape: 'square', floorSlope: 0, floorCurve: 0, obstacles: [flap('mix-flap', w * 0.68, h * 0.34, -9), clam('mix-clam', w * 0.27, h * 0.64)], currents: [vortex('mix-vortex', w * 0.55, h * 0.3)] },
+    20: { arenaShape: 'square', floorSlope: 0, floorCurve: 0, obstacles: [ramp('final-ramp', w * 0.28, h * 0.72, -8), piston('final-piston', 'right', h * 0.27)], currents: [vortex('final-vortex', w * 0.34, h * 0.42)] },
+  };
+  return layouts[levelId];
+}
+
+const PILOT_MISSIONS: Partial<Record<number, PilotMission>> = {
+  5: { kind: 'hit', obstacle: 'clam', target: 2, reward: 'rainbow', tr: 'Midyeden 2 kez sektir', en: 'Bounce from the clam twice' },
+  7: { kind: 'hit', obstacle: 'piston', target: 2, reward: 'heavy', tr: 'Mercan pistona 2 kez çarp', en: 'Hit the coral piston twice' },
+  8: { kind: 'hit', obstacle: 'wheel', target: 2, reward: 'rainbow', tr: 'Dümene 2 kez dokun', en: 'Touch the ship wheel twice' },
+  9: { kind: 'vortex', target: 1, reward: 'rainbow', tr: 'Bir balonu girdaptan geçir', en: 'Guide one bubble through the vortex' },
+  10: { kind: 'hit', obstacle: 'flap', target: 2, reward: 'heavy', tr: 'Kapağı 2 kez hareket ettir', en: 'Move the hatch twice' },
+  11: { kind: 'break', obstacle: 'crate', target: 2, reward: 'heavy', tr: 'Sandığı iki darbede kır', en: 'Break the crate in two hits' },
+};
+
+const OBSTACLE_MISSION_COPY: Record<ObstacleVisualKind, { tr: string; en: string }> = {
+  ramp: { tr: 'Mercan rampaya 2 kez çarp', en: 'Hit the coral ramp twice' },
+  clam: { tr: 'Midyeden 2 kez sektir', en: 'Bounce from the clam twice' },
+  anchor: { tr: 'Çapaya 2 kez dokun', en: 'Touch the anchor twice' },
+  piston: { tr: 'Mercan pistona 2 kez çarp', en: 'Hit the coral piston twice' },
+  wheel: { tr: 'Dümene 2 kez dokun', en: 'Touch the ship wheel twice' },
+  flap: { tr: 'Kapağı 2 kez hareket ettir', en: 'Move the hatch twice' },
+  crate: { tr: 'Sandığı iki darbede kır', en: 'Break the crate in two hits' },
+};
+
+function missionForLevel(levelId: number, layout: BoardLayout): PilotMission | undefined {
+  const authored = PILOT_MISSIONS[levelId];
+  if (authored) return authored;
+  // One calm stage in every four leaves breathing room; the others turn the
+  // existing obstacle layout into a short optional objective with a power-up.
+  if (levelId < 12 || levelId % 4 === 0) return undefined;
+  if (layout.currents.some(current => current.kind === 'vortex')) {
+    return {
+      kind: 'vortex', target: 1, reward: levelId % 2 ? 'rainbow' : 'heavy',
+      tr: 'Bir balonu girdaptan geçir', en: 'Guide one bubble through the vortex',
+    };
+  }
+  const obstacle = layout.obstacles.find(item => item.visual && item.role !== 'boundary');
+  if (!obstacle?.visual) return undefined;
+  const copy = OBSTACLE_MISSION_COPY[obstacle.visual];
+  return {
+    kind: obstacle.visual === 'crate' && obstacle.breakHits ? 'break' : 'hit',
+    obstacle: obstacle.visual,
+    target: 2,
+    reward: levelId % 2 ? 'rainbow' : 'heavy',
+    tr: copy.tr,
+    en: copy.en,
+  };
+}
+
+function boundaryFeaturesForLevel(levelId: number, arenaShape: ArenaShape, w: number, h: number): BoardObstacle[] {
+  if (levelId <= 3) return [];
+  const world = Math.floor((levelId - 1) / LEVELS_PER_PAGE);
+  // Leave roughly one level in five visually open, so the framed stages feel
+  // special instead of every board becoming equally busy.
+  if ((levelId * 7 + world * 3) % 5 === 0) return [];
+  const variant = (levelId + world * 5) % 8;
+  const lengthNudge = ((levelId * 17) % 11) - 5;
+  const heightNudge = ((((levelId * 29) % 9) - 4) / 100) * h;
+  const maxY = arenaShape === 'round' ? h * 0.62 : h * 0.66;
+  const yAt = (ratio: number) => Math.max(h * 0.25, Math.min(maxY, h * ratio + heightNudge));
+  const left = (
+    id: string,
+    y: number,
+    length: number,
+    thickness: number,
+    angle: number,
+    extras: Partial<BoardObstacle> = {},
+  ): BoardObstacle => ({
+    id: `frame-${levelId}-${id}`,
+    cx: BOARD_WALL_INSET + length / 2 - 5,
+    cy: y,
+    length,
+    thickness,
+    angle,
+    kind: 'pearl',
+    role: 'boundary',
+    ...extras,
+  });
+  const right = (
+    id: string,
+    y: number,
+    length: number,
+    thickness: number,
+    angle: number,
+    extras: Partial<BoardObstacle> = {},
+  ): BoardObstacle => ({
+    id: `frame-${levelId}-${id}`,
+    cx: w - BOARD_WALL_INSET - length / 2 + 5,
+    cy: y,
+    length,
+    thickness,
+    angle,
+    kind: 'pearl',
+    role: 'boundary',
+    ...extras,
+  });
+  const short = 48 + lengthNudge;
+  const medium = 62 + lengthNudge;
+  const long = 76 + lengthNudge;
+  switch (variant) {
+    case 0:
+      return [
+        left('upper-shelf', yAt(0.34), medium, 34, 8),
+        right('lower-shelf', yAt(0.59), short, 32, -10),
+      ];
+    case 1:
+      return [
+        left('gate-left', yAt(0.47), medium, 36, 5, { reaction: 'spring' }),
+        right('gate-right', yAt(0.47), medium, 36, -5, { reaction: 'spring' }),
+      ];
+    case 2:
+      return [
+        left('step-high', yAt(0.29), short, 31, 7),
+        right('step-middle', yAt(0.45), short + 5, 33, -7),
+        left('step-low', yAt(0.61), short + 10, 35, 10),
+      ];
+    case 3:
+      return [
+        left('long-fin', yAt(0.43), long, 38, 12),
+        right('spring-pearl', yAt(0.61), 44, 44, 0, { reaction: 'spring', kind: 'stone' }),
+      ];
+    case 4:
+      return [
+        right('double-high', yAt(0.32), medium, 34, -9),
+        right('double-low', yAt(0.57), long - 7, 37, -13),
+      ];
+    case 5:
+      return [
+        left('tide-fin-left', yAt(0.39), medium, 35, 6, { motion: { type: 'seesaw', speed: 0.42, range: 7 } }),
+        right('tide-fin-right', yAt(0.58), medium - 4, 35, -6, { motion: { type: 'seesaw', speed: -0.46, range: 8 } }),
+      ];
+    case 6:
+      return [
+        left('stagger-left', yAt(0.52), long - 4, 38, -8, { reaction: 'spring' }),
+        right('stagger-right', yAt(0.31), short + 4, 32, 9),
+      ];
+    default:
+      return [
+        right('single-surprise', yAt(0.46), long, 39, -11, {
+          reaction: 'spring',
+          motion: { type: 'seesaw', speed: 0.38, range: 6 },
+        }),
+      ];
+  }
+}
+
 function boardLayoutForLevel(levelId: number): BoardLayout {
-  const stage = (levelId - 1) % 8;
-  const world = Math.floor((levelId - 1) / 8);
+  const stage = (levelId - 1) % BOARD_PATTERN_COUNT;
+  const world = Math.floor((levelId - 1) / 50);
   const theme = BOARD_THEMES[world % BOARD_THEMES.length] as typeof BOARD_THEMES[number];
   const w = BOARD_WIDTH;
   const h = BOARD_HEIGHT;
-  const patterns: Array<Pick<BoardLayout, 'floorSlope' | 'obstacles'>> = [
-    { floorSlope: 0, obstacles: [] },
-    { floorSlope: 22, obstacles: [] },
+  const patterns: BoardPattern[] = [
+    // The first three layouts teach aiming on increasingly shaped containers
+    // without introducing a blocking obstacle during the tutorial.
+    { arenaShape: 'square', floorSlope: 0, floorCurve: 0, obstacles: [] },
+    { arenaShape: 'square', floorSlope: 18, floorCurve: 0, obstacles: [] },
+    { arenaShape: 'round', floorSlope: 0, floorCurve: 76, obstacles: [] },
     {
-      floorSlope: -22,
+      arenaShape: 'square',
+      floorSlope: 15,
+      floorCurve: 0,
       obstacles: [
-        { id: 'wood-shelf', cx: w * 0.69, cy: h * 0.65, length: w * 0.34, thickness: 30, angle: -9, kind: 'pearl' },
-        { id: 'wood-bumper', cx: w * 0.28, cy: h * 0.51, length: 43, thickness: 43, angle: 0, kind: 'stone' },
+        { id: 'right-reef-ledge', cx: w - BOARD_WALL_INSET - 43, cy: h * 0.59, length: 86, thickness: 35, angle: -5, kind: 'coral', role: 'boundary' },
+        { id: 'right-reef-pearl', cx: w * 0.69, cy: h * 0.43, length: 47, thickness: 47, angle: 0, kind: 'stone', reaction: 'spring' },
       ],
     },
     {
+      arenaShape: 'square',
+      floorSlope: -15,
+      floorCurve: 0,
+      obstacles: [
+        { id: 'left-reef-ledge', cx: BOARD_WALL_INSET + 43, cy: h * 0.59, length: 86, thickness: 35, angle: 5, kind: 'coral', role: 'boundary' },
+        { id: 'left-reef-pearl', cx: w * 0.31, cy: h * 0.43, length: 47, thickness: 47, angle: 0, kind: 'stone', reaction: 'spring' },
+      ],
+    },
+    {
+      arenaShape: 'round',
       floorSlope: 0,
+      floorCurve: 68,
       obstacles: [
-        { id: 'center-beam', cx: w * 0.5, cy: h * 0.61, length: w * 0.4, thickness: 32, angle: 0, kind: 'coral' },
-        { id: 'upper-bumper', cx: w * 0.72, cy: h * 0.43, length: 42, thickness: 42, angle: 0, kind: 'stone' },
+        { id: 'bowl-left-fin', cx: BOARD_WALL_INSET + 34, cy: h * 0.64, length: 68, thickness: 34, angle: -9, kind: 'pearl', role: 'boundary' },
+        { id: 'bowl-right-fin', cx: w - BOARD_WALL_INSET - 34, cy: h * 0.64, length: 68, thickness: 34, angle: 9, kind: 'pearl', role: 'boundary' },
       ],
     },
     {
-      floorSlope: 16,
-      obstacles: [
-        { id: 'left-ramp', cx: w * 0.31, cy: h * 0.6, length: w * 0.34, thickness: 31, angle: 14, kind: 'stone' },
-        { id: 'right-bumper', cx: w * 0.73, cy: h * 0.49, length: 44, thickness: 44, angle: 0, kind: 'pearl' },
-      ],
-    },
-    {
-      floorSlope: -16,
-      obstacles: [
-        { id: 'right-ramp', cx: w * 0.69, cy: h * 0.59, length: w * 0.34, thickness: 31, angle: -14, kind: 'coral' },
-        { id: 'left-bumper', cx: w * 0.27, cy: h * 0.46, length: 44, thickness: 44, angle: 0, kind: 'pearl' },
-      ],
-    },
-    {
+      arenaShape: 'drop',
       floorSlope: 0,
+      floorCurve: 0,
       obstacles: [
-        { id: 'split-left', cx: w * 0.28, cy: h * 0.64, length: w * 0.29, thickness: 29, angle: -11, kind: 'pearl' },
-        { id: 'split-right', cx: w * 0.72, cy: h * 0.64, length: w * 0.29, thickness: 29, angle: 11, kind: 'pearl' },
-        { id: 'split-bumper', cx: w * 0.5, cy: h * 0.45, length: 42, thickness: 42, angle: 0, kind: 'stone' },
+        { id: 'short-current-ramp', cx: w * 0.68, cy: h * 0.59, length: w * 0.25, thickness: 35, angle: -13, kind: 'pearl', motion: { type: 'slide', speed: 0.72, range: 18 } },
+        { id: 'current-bumper', cx: w * 0.76, cy: h * 0.43, length: 49, thickness: 49, angle: 0, kind: 'stone', reaction: 'spring' },
       ],
     },
     {
-      floorSlope: world % 2 ? -20 : 20,
+      arenaShape: 'drop',
+      floorSlope: 0,
+      floorCurve: 20,
       obstacles: [
-        { id: 'upper-current', cx: w * 0.62, cy: h * 0.5, length: w * 0.34, thickness: 30, angle: world % 2 ? 12 : -12, kind: 'stone' },
-        { id: 'lower-current', cx: w * 0.33, cy: h * 0.69, length: w * 0.28, thickness: 28, angle: world % 2 ? -8 : 8, kind: 'coral' },
+        { id: 'left-high-fin', cx: BOARD_WALL_INSET + 31, cy: h * 0.47, length: 62, thickness: 34, angle: 8, kind: 'coral', role: 'boundary' },
+        { id: 'right-low-fin', cx: w - BOARD_WALL_INSET - 31, cy: h * 0.67, length: 62, thickness: 34, angle: -8, kind: 'coral', role: 'boundary' },
+      ],
+    },
+    {
+      arenaShape: 'square',
+      floorSlope: 14,
+      floorCurve: 0,
+      obstacles: [
+        { id: 'right-upper-current', cx: w * 0.72, cy: h * 0.48, length: w * 0.25, thickness: 36, angle: -13, kind: 'stone', motion: { type: 'seesaw', speed: 0.66, range: 13 } },
+        { id: 'right-lower-pearl', cx: w * 0.74, cy: h * 0.68, length: 47, thickness: 47, angle: 0, kind: 'pearl', reaction: 'spring' },
+      ],
+    },
+    {
+      arenaShape: 'square',
+      floorSlope: -14,
+      floorCurve: 0,
+      obstacles: [
+        { id: 'left-upper-current', cx: w * 0.28, cy: h * 0.48, length: w * 0.25, thickness: 36, angle: 13, kind: 'stone', motion: { type: 'seesaw', speed: 0.66, range: 13 } },
+        { id: 'left-lower-pearl', cx: w * 0.26, cy: h * 0.68, length: 47, thickness: 47, angle: 0, kind: 'pearl', reaction: 'spring' },
+      ],
+    },
+    {
+      arenaShape: 'cave',
+      floorSlope: 0,
+      floorCurve: 0,
+      obstacles: [
+        { id: 'spinner-arm-a', cx: w * 0.5, cy: h * 0.54, length: w * 0.22, thickness: 32, angle: 0, kind: 'pearl', motion: { type: 'rotate', speed: 24, range: 0 } },
+        { id: 'spinner-arm-b', cx: w * 0.5, cy: h * 0.54, length: w * 0.22, thickness: 32, angle: 90, kind: 'pearl', motion: { type: 'rotate', speed: 24, range: 0 } },
+        { id: 'bridge-bumper', cx: w * 0.75, cy: h * 0.38, length: 50, thickness: 50, angle: 0, kind: 'stone', reaction: 'spring' },
+      ],
+    },
+    {
+      arenaShape: 'round',
+      floorSlope: 0,
+      floorCurve: 84,
+      obstacles: [
+        { id: 'bowl-left-bumper', cx: w * 0.25, cy: h * 0.5, length: 48, thickness: 48, angle: 0, kind: 'stone', reaction: 'spring' },
+        { id: 'bowl-right-bumper', cx: w * 0.75, cy: h * 0.5, length: 48, thickness: 48, angle: 0, kind: 'stone', reaction: 'spring' },
+      ],
+    },
+    {
+      arenaShape: 'cave',
+      floorSlope: 11,
+      floorCurve: 0,
+      obstacles: [
+        { id: 'left-deep-ledge', cx: BOARD_WALL_INSET + 38, cy: h * 0.68, length: 76, thickness: 36, angle: 10, kind: 'pearl', role: 'boundary' },
+        { id: 'upper-free-bumper', cx: w * 0.27, cy: h * 0.4, length: 46, thickness: 46, angle: 0, kind: 'coral', reaction: 'spring' },
+        { id: 'left-seesaw', cx: w * 0.43, cy: h * 0.54, length: w * 0.22, thickness: 31, angle: -8, kind: 'pearl', motion: { type: 'seesaw', speed: 0.6, range: 11 } },
+      ],
+    },
+    {
+      arenaShape: 'cave',
+      floorSlope: -11,
+      floorCurve: 0,
+      obstacles: [
+        { id: 'right-deep-ledge', cx: w - BOARD_WALL_INSET - 38, cy: h * 0.68, length: 76, thickness: 36, angle: -10, kind: 'pearl', role: 'boundary' },
+        { id: 'upper-free-bumper-mirror', cx: w * 0.73, cy: h * 0.4, length: 46, thickness: 46, angle: 0, kind: 'coral', reaction: 'spring' },
+        { id: 'right-seesaw', cx: w * 0.57, cy: h * 0.54, length: w * 0.22, thickness: 31, angle: 8, kind: 'pearl', motion: { type: 'seesaw', speed: 0.6, range: 11 } },
+      ],
+    },
+    {
+      arenaShape: 'square',
+      floorSlope: 0,
+      floorCurve: 0,
+      obstacles: [
+        { id: 'orbiting-pearl', cx: w * 0.5, cy: h * 0.43, length: 48, thickness: 48, angle: 0, kind: 'pearl', reaction: 'spring', motion: { type: 'orbit', speed: 0.72, range: Math.min(56, w * 0.15) } },
+        { id: 'orbit-floor-bumper', cx: w * 0.5, cy: h * 0.67, length: 45, thickness: 45, angle: 0, kind: 'stone', reaction: 'spring' },
+      ],
+    },
+    {
+      arenaShape: 'drop',
+      floorSlope: 0,
+      floorCurve: 16,
+      currents: [
+        { id: 'east-stream', kind: 'stream', cx: w * 0.5, cy: h * 0.38, width: w * 0.68, height: 118, strength: 0.22, angle: 0 },
+      ],
+      obstacles: [
+        { id: 'stream-right-ramp', cx: w * 0.7, cy: h * 0.64, length: w * 0.23, thickness: 31, angle: -11, kind: 'pearl' },
+      ],
+    },
+    {
+      arenaShape: 'cave',
+      floorSlope: 0,
+      floorCurve: 0,
+      currents: [
+        { id: 'center-vortex', kind: 'vortex', cx: w * 0.5, cy: h * 0.43, width: w * 0.55, height: 170, strength: 0.18, clockwise: true },
+      ],
+      obstacles: [
+        { id: 'vortex-left-pearl', cx: w * 0.25, cy: h * 0.63, length: 44, thickness: 44, angle: 0, kind: 'stone', reaction: 'spring' },
+        { id: 'vortex-right-pearl', cx: w * 0.75, cy: h * 0.63, length: 44, thickness: 44, angle: 0, kind: 'stone', reaction: 'spring' },
+      ],
+    },
+    {
+      arenaShape: 'round',
+      floorSlope: 0,
+      floorCurve: 78,
+      obstacles: [
+        { id: 'pinball-upper', cx: w * 0.5, cy: h * 0.38, length: 41, thickness: 41, angle: 0, kind: 'pearl', reaction: 'spring' },
+        { id: 'pinball-middle', cx: w * 0.5, cy: h * 0.52, length: 39, thickness: 39, angle: 0, kind: 'coral', reaction: 'spring' },
+        { id: 'pinball-lower', cx: w * 0.5, cy: h * 0.66, length: 41, thickness: 41, angle: 0, kind: 'coral', reaction: 'spring' },
+      ],
+    },
+    {
+      arenaShape: 'round',
+      floorSlope: 0,
+      floorCurve: 72,
+      currents: [
+        { id: 'left-updraft', kind: 'stream', cx: w * 0.3, cy: h * 0.43, width: w * 0.31, height: 155, strength: 0.17, angle: -88 },
+        { id: 'right-downdraft', kind: 'stream', cx: w * 0.7, cy: h * 0.43, width: w * 0.31, height: 155, strength: 0.15, angle: 92 },
+      ],
+      obstacles: [
+        { id: 'current-divider', cx: w * 0.5, cy: h * 0.6, length: w * 0.2, thickness: 30, angle: 0, kind: 'pearl' },
+      ],
+    },
+    {
+      arenaShape: 'square',
+      floorSlope: 9,
+      floorCurve: 0,
+      obstacles: [
+        { id: 'moving-gate-high', cx: w * 0.25, cy: h * 0.43, length: 45, thickness: 28, angle: 4, kind: 'stone', motion: { type: 'slide', speed: 0.62, range: 10 } },
+        { id: 'moving-gate-low', cx: w * 0.75, cy: h * 0.61, length: 45, thickness: 28, angle: -4, kind: 'stone', motion: { type: 'slide', speed: -0.58, range: 10, phase: 1.4 } },
+      ],
+    },
+    {
+      arenaShape: 'drop',
+      floorSlope: 0,
+      floorCurve: 18,
+      obstacles: [
+        { id: 'split-left-ramp', cx: w * 0.22, cy: h * 0.55, length: w * 0.14, thickness: 32, angle: 14, kind: 'coral' },
+        { id: 'split-right-ramp', cx: w * 0.78, cy: h * 0.55, length: w * 0.14, thickness: 32, angle: -14, kind: 'coral' },
+      ],
+    },
+    {
+      arenaShape: 'cave',
+      floorSlope: 0,
+      floorCurve: 0,
+      obstacles: [
+        { id: 'single-spinner', cx: w * 0.5, cy: h * 0.48, length: w * 0.22, thickness: 30, angle: 0, kind: 'pearl', motion: { type: 'rotate', speed: 18, range: 0 } },
+      ],
+    },
+    {
+      arenaShape: 'square',
+      floorSlope: -8,
+      floorCurve: 0,
+      currents: [
+        { id: 'orbit-cross-current', kind: 'stream', cx: w * 0.5, cy: h * 0.38, width: w * 0.64, height: 105, strength: 0.19, angle: 180 },
+      ],
+      obstacles: [
+        { id: 'cross-current-orbit', cx: w * 0.5, cy: h * 0.51, length: 47, thickness: 47, angle: 0, kind: 'pearl', reaction: 'spring', motion: { type: 'orbit', speed: -0.66, range: Math.min(48, w * 0.13), phase: 0.8 } },
+      ],
+    },
+    {
+      arenaShape: 'cave',
+      floorSlope: 0,
+      floorCurve: 12,
+      obstacles: [
+        { id: 'reef-zigzag-high', cx: w * 0.2, cy: h * 0.42, length: 42, thickness: 29, angle: 12, kind: 'coral' },
+        { id: 'reef-zigzag-low', cx: w * 0.8, cy: h * 0.61, length: 42, thickness: 29, angle: -12, kind: 'pearl', reaction: 'spring' },
       ],
     },
   ];
-  const pattern = patterns[stage] as Pick<BoardLayout, 'floorSlope' | 'obstacles'>;
-  return { ...theme, floorSlope: pattern.floorSlope, obstacles: pattern.obstacles };
+  if (__DEV__ && patterns.length !== BOARD_PATTERN_COUNT) {
+    throw new Error(`Board pattern catalog must contain ${BOARD_PATTERN_COUNT} layouts.`);
+  }
+  // Stages 1 and 2 are obstacle-free only for the tutorial. In later cycles
+  // they become current/pinball boards, leaving roughly one calm board per 24
+  // levels instead of repeating three plain boards in every cycle.
+  const patternIndex = levelId > 3 && stage === 1 ? 15 : levelId > 3 && stage === 2 ? 17 : stage;
+  const pattern = showcasePatternForLevel(levelId, w, h) ?? patterns[patternIndex] as BoardPattern;
+  const cycle = Math.floor((levelId - 1) / patterns.length);
+  const direction = (cycle + stage) % 2 ? -1 : 1;
+  const speedScale = 1 + (cycle % 5) * 0.045;
+  const transformObstacle = (obstacle: BoardObstacle, index: number): BoardObstacle => {
+    const positionHash = ((levelId * 37 + index * 53) % 101) / 100;
+    const angleHash = ((levelId * 61 + index * 29) % 97) / 96;
+    const canVary = levelId > 20 && obstacle.role !== 'boundary';
+    const isRound = Math.abs(obstacle.length - obstacle.thickness) < 0.5;
+    const generatedVisual: ObstacleVisualKind | undefined = obstacle.visual ?? (
+      canVary && obstacle.motion?.type === 'slide' ? 'piston'
+        : canVary && obstacle.motion?.type === 'seesaw' ? 'flap'
+          : canVary && isRound && obstacle.motion?.type === 'orbit' ? 'wheel'
+            : canVary && isRound && obstacle.reaction === 'spring' ? 'clam'
+              : canVary && !isRound && !obstacle.motion ? 'ramp'
+                : undefined
+    );
+    return {
+      ...obstacle,
+      visual: generatedVisual,
+      cx: obstacle.cx + (canVary ? (positionHash - 0.5) * 12 : 0),
+      cy: obstacle.cy + (levelId <= 3 ? 0 : (angleHash - 0.5) * 10),
+      length: obstacle.length * (canVary && !isRound ? 0.97 + positionHash * 0.06 : 1),
+      angle: normalizeDegrees(obstacle.angle + (canVary && !isRound && !obstacle.motion ? (angleHash - 0.5) * 7 : 0)),
+      motion: obstacle.motion
+        ? {
+          ...obstacle.motion,
+          speed: obstacle.motion.speed * direction * speedScale,
+          phase: (obstacle.motion.phase ?? 0) + (cycle % 6) * 0.23 + positionHash * 0.18,
+        }
+        : undefined,
+    };
+  };
+  const fixedObstacles = pattern.obstacles.map(transformObstacle);
+  const currents = (pattern.currents ?? []).map((current, index): BoardCurrent => {
+    const reverse = (cycle + index) % 2 === 1;
+    return {
+      ...current,
+      cx: current.cx + ((((levelId * 19 + index * 31) % 9) - 4) * 0.8),
+      strength: current.strength * (0.94 + (cycle % 4) * 0.035),
+      angle: current.kind === 'stream'
+        ? (current.angle ?? 0) + (reverse ? 180 : 0)
+        : current.angle,
+      clockwise: current.kind === 'vortex' ? Boolean(current.clockwise) !== reverse : current.clockwise,
+    };
+  });
+  // Keep the hand-authored, route-tested obstacle set active. Large batches of
+  // procedural rail pieces made some device layouts unstable, so they remain
+  // disabled until they can be introduced in smaller reviewed groups.
+  const obstacles = fixedObstacles;
+  return {
+    ...theme,
+    arenaShape: pattern.arenaShape,
+    floorSlope: pattern.floorSlope,
+    floorCurve: pattern.floorCurve,
+    obstacles,
+    currents,
+  };
 }
 
+const normalizeDegrees = (value: number) => {
+  const wrapped = ((value + 180) % 360 + 360) % 360 - 180;
+  return Math.abs(wrapped) < 0.0001 ? 0 : wrapped;
+};
+
+function obstacleAtTime(obstacle: BoardObstacle, timeSeconds: number): BoardObstacle {
+  const motion = obstacle.motion;
+  if (!motion) return { ...obstacle, velocityX: 0, velocityY: 0, angularVelocity: 0 };
+  const phase = timeSeconds * motion.speed + (motion.phase ?? 0);
+  if (motion.type === 'rotate') {
+    return {
+      ...obstacle,
+      angle: normalizeDegrees(obstacle.angle + timeSeconds * motion.speed + (motion.phase ?? 0) * 180 / Math.PI),
+      velocityX: 0,
+      velocityY: 0,
+      angularVelocity: motion.speed * Math.PI / 180 / 60,
+    };
+  }
+  if (motion.type === 'slide') {
+    return {
+      ...obstacle,
+      cx: obstacle.cx + Math.sin(phase) * motion.range,
+      velocityX: Math.cos(phase) * motion.range * motion.speed / 60,
+      velocityY: 0,
+      angularVelocity: 0,
+    };
+  }
+  if (motion.type === 'orbit') {
+    const verticalRange = motion.range * 0.62;
+    return {
+      ...obstacle,
+      cx: obstacle.cx + Math.cos(phase) * motion.range,
+      cy: obstacle.cy + Math.sin(phase) * verticalRange,
+      velocityX: -Math.sin(phase) * motion.range * motion.speed / 60,
+      velocityY: Math.cos(phase) * verticalRange * motion.speed / 60,
+      angularVelocity: 0,
+    };
+  }
+  return {
+    ...obstacle,
+    angle: normalizeDegrees(obstacle.angle + Math.sin(phase) * motion.range),
+    velocityX: 0,
+    velocityY: 0,
+    angularVelocity: Math.cos(phase) * motion.range * motion.speed * Math.PI / 180 / 60,
+  };
+}
+
+// Physics only needs a normalized angle, but using that same value in the UI
+// makes a rotating obstacle jump from 180deg to -180deg once per revolution.
+// Keep the rendered rotation continuous so contact with a bubble never appears
+// to shake or reverse the obstacle for a frame.
+function obstacleVisualAngleAtTime(obstacle: BoardObstacle, timeSeconds: number) {
+  if (obstacle.motion?.type === 'rotate') {
+    return obstacle.angle
+      + timeSeconds * obstacle.motion.speed
+      + (obstacle.motion.phase ?? 0) * 180 / Math.PI;
+  }
+  return obstacleAtTime(obstacle, timeSeconds).angle;
+}
+
+const boardLayoutAtTime = (layout: BoardLayout, timeSeconds: number): BoardLayout => ({
+  ...layout,
+  obstacles: layout.obstacles.map(obstacle => obstacleAtTime(obstacle, timeSeconds)),
+});
+
+function sideWallInsetAt(layout: BoardLayout, centerY: number) {
+  const normalizedY = Math.max(0, Math.min(1, centerY / BOARD_HEIGHT));
+  if (layout.arenaShape === 'round') {
+    // The upper chamber stays rectangular. Its rounded character comes only
+    // from the bowl-shaped floor, so bubbles retain the full horizontal aiming
+    // range and cannot disappear behind a curved side mask.
+    return ROUND_PLAYFIELD_INSET;
+  }
+  if (layout.arenaShape === 'drop') {
+    const topNeck = normalizedY < 0.2 ? ((0.2 - normalizedY) / 0.2) ** 2 * 19 : 0;
+    const bottomRound = normalizedY > 0.74 ? ((normalizedY - 0.74) / 0.26) ** 2 * 18 : 0;
+    return BOARD_WALL_INSET + topNeck + bottomRound;
+  }
+  if (layout.arenaShape === 'cave') {
+    const caveMouth = normalizedY < 0.16 ? ((0.16 - normalizedY) / 0.16) ** 2 * 12 : 0;
+    return BOARD_WALL_INSET + caveMouth;
+  }
+  return BOARD_WALL_INSET;
+}
+
+const wallContactInsetAt = (layout: BoardLayout, centerY: number) =>
+  sideWallInsetAt(layout, centerY) + (
+    layout.arenaShape === 'round'
+      ? ROUND_SIDE_FRAME_CLEARANCE
+      : STANDARD_SIDE_FRAME_CLEARANCE
+  );
+
 const DEFAULT_BOARD_LAYOUT = boardLayoutForLevel(1);
-const floorSurfaceAt = (layout: BoardLayout, centerX: number) =>
-  BOARD_HEIGHT - FLOOR_CLEARANCE + layout.floorSlope * ((centerX - BOARD_WIDTH / 2) / BOARD_WIDTH);
-const floorTopForPiece = (piece: Pick<Piece, 'x' | 'size'>, layout: BoardLayout) =>
-  floorSurfaceAt(layout, piece.x + piece.size / 2) - piece.size;
+const floorSurfaceAt = (layout: BoardLayout, centerX: number) => {
+  if (layout.arenaShape === 'round') {
+    const radiusX = Math.max(1, BOARD_WIDTH / 2 - ROUND_PLAYFIELD_INSET);
+    const radiusY = Math.max(1, ROUND_FRAME_INNER_BOTTOM_Y - ROUND_FRAME_CURVE_START_Y);
+    const dx = Math.max(-radiusX, Math.min(radiusX, centerX - BOARD_WIDTH / 2));
+    const normalizedX = dx / radiusX;
+    return ROUND_FRAME_CURVE_START_Y + radiusY * Math.sqrt(Math.max(0, 1 - normalizedX ** 2));
+  }
+  const halfUsableWidth = Math.max(1, BOARD_WIDTH / 2 - BOARD_WALL_INSET);
+  const normalizedX = Math.max(-1, Math.min(1, (centerX - BOARD_WIDTH / 2) / halfUsableWidth));
+  const slopeOffset = layout.floorSlope * ((centerX - BOARD_WIDTH / 2) / BOARD_WIDTH);
+  const bowlOffset = -layout.floorCurve * normalizedX * normalizedX;
+  return BOARD_HEIGHT - FLOOR_CLEARANCE + slopeOffset + bowlOffset;
+};
+const floorGradientAt = (layout: BoardLayout, centerX: number) => {
+  if (layout.arenaShape === 'round') {
+    const radiusX = Math.max(1, BOARD_WIDTH / 2 - ROUND_PLAYFIELD_INSET);
+    const radiusY = Math.max(1, ROUND_FRAME_INNER_BOTTOM_Y - ROUND_FRAME_CURVE_START_Y);
+    const dx = Math.max(-radiusX + 0.5, Math.min(radiusX - 0.5, centerX - BOARD_WIDTH / 2));
+    const normalizedX = dx / radiusX;
+    return -(radiusY * normalizedX) / Math.max(2, radiusX * Math.sqrt(Math.max(0, 1 - normalizedX ** 2)));
+  }
+  const halfUsableWidth = Math.max(1, BOARD_WIDTH / 2 - BOARD_WALL_INSET);
+  const normalizedX = Math.max(-1, Math.min(1, (centerX - BOARD_WIDTH / 2) / halfUsableWidth));
+  return layout.floorSlope / BOARD_WIDTH - (2 * layout.floorCurve * normalizedX) / halfUsableWidth;
+};
+const floorTopForPiece = (piece: Pick<Piece, 'x' | 'size'>, layout: BoardLayout) => {
+  if (layout.arenaShape === 'round') {
+    const pieceRadius = piece.size / 2;
+    const surfaceRadiusX = Math.max(pieceRadius + 1, BOARD_WIDTH / 2 - ROUND_PLAYFIELD_INSET);
+    const surfaceRadiusY = Math.max(pieceRadius + 1, ROUND_FRAME_INNER_BOTTOM_Y - ROUND_FRAME_CURVE_START_Y);
+    const centerRadiusX = Math.max(1, surfaceRadiusX - pieceRadius - FLOOR_FRAME_CLEARANCE);
+    const centerRadiusY = Math.max(1, surfaceRadiusY - pieceRadius - FLOOR_FRAME_CLEARANCE);
+    const dx = Math.max(-centerRadiusX, Math.min(centerRadiusX, piece.x + pieceRadius - BOARD_WIDTH / 2));
+    const normalizedX = dx / centerRadiusX;
+    const centerFloorY = ROUND_FRAME_CURVE_START_Y
+      + centerRadiusY * Math.sqrt(Math.max(0, 1 - normalizedX ** 2));
+    return centerFloorY - pieceRadius;
+  }
+  return floorSurfaceAt(layout, piece.x + piece.size / 2) - piece.size - FLOOR_FRAME_CLEARANCE;
+};
+
+const floorGradientForPiece = (piece: Pick<Piece, 'x' | 'size'>, layout: BoardLayout) => {
+  if (layout.arenaShape !== 'round') return floorGradientAt(layout, piece.x + piece.size / 2);
+  const pieceRadius = piece.size / 2;
+  const surfaceRadiusX = Math.max(pieceRadius + 1, BOARD_WIDTH / 2 - ROUND_PLAYFIELD_INSET);
+  const surfaceRadiusY = Math.max(pieceRadius + 1, ROUND_FRAME_INNER_BOTTOM_Y - ROUND_FRAME_CURVE_START_Y);
+  const centerRadiusX = Math.max(1, surfaceRadiusX - pieceRadius - FLOOR_FRAME_CLEARANCE);
+  const centerRadiusY = Math.max(1, surfaceRadiusY - pieceRadius - FLOOR_FRAME_CLEARANCE);
+  const dx = Math.max(
+    -centerRadiusX + 0.5,
+    Math.min(centerRadiusX - 0.5, piece.x + pieceRadius - BOARD_WIDTH / 2),
+  );
+  const normalizedX = dx / centerRadiusX;
+  return -(centerRadiusY * normalizedX)
+    / Math.max(2, centerRadiusX * Math.sqrt(Math.max(0, 1 - normalizedX ** 2)));
+};
+
+const constrainResizedPieceToArena = (
+  x: number,
+  y: number,
+  size: number,
+  layout: BoardLayout,
+) => {
+  let constrainedX = x;
+  let constrainedY = y;
+  // Shape insets can depend on height. Two small passes keep both the side and
+  // floor constraints correct after a merge changes the bubble diameter.
+  for (let pass = 0; pass < 2; pass += 1) {
+    const wallInset = wallContactInsetAt(layout, constrainedY + size / 2);
+    constrainedX = Math.max(wallInset, Math.min(BOARD_WIDTH - size - wallInset, constrainedX));
+    constrainedY = Math.min(floorTopForPiece({ x: constrainedX, size }, layout), constrainedY);
+  }
+  return { x: constrainedX, y: constrainedY };
+};
 const PUFFERFISH_ASSETS: Record<CreatureType, number> = {
   berry: require('./assets/pufferfish-berry-v3.png'),
   coral: require('./assets/pufferfish-coral-v3.png'),
@@ -251,6 +940,7 @@ const CORAL_WRECK_BOARD_ASSET = require('./assets/coral-wreck-board-bg-v1.png');
 const SHIPWRECK_WOOD_ASSET = require('./assets/shipwreck-wood-texture-v1.png');
 const CORAL_WRECK_SAND_ASSET = require('./assets/coral-wreck-sand-v1.png');
 const CORAL_WRECK_SIDE_ASSET = require('./assets/coral-wreck-side-frame-v2.png');
+const ROUND_PLAYFIELD_FRAME_ASSET = require('./assets/round-bottom-playfield-frame-v2.png');
 const MUSIC_ASSET = require('./assets/ocean-ambient.wav');
 const DROP_SFX_ASSET = require('./assets/sfx-water-drop.wav');
 const MERGE_SFX_ASSET = require('./assets/sfx-water-merge.wav');
@@ -273,11 +963,13 @@ const PRELOAD_IMAGE_ASSETS = [
   SHIPWRECK_WOOD_ASSET,
   CORAL_WRECK_SAND_ASSET,
   CORAL_WRECK_SIDE_ASSET,
+  ROUND_PLAYFIELD_FRAME_ASSET,
   MERGE_BUBBLE_PARTICLE_ASSET,
 ];
 const PRELOAD_AUDIO_ASSETS = [MUSIC_ASSET, DROP_SFX_ASSET, MERGE_SFX_ASSET, POP_SFX_ASSET];
 const PRELOAD_ASSETS = [...PRELOAD_IMAGE_ASSETS, ...PRELOAD_AUDIO_ASSETS];
 const PROGRESS_KEY = 'puf-puf-unlocked-level';
+const LAST_LEVEL_KEY = 'bubblefin-last-level-index';
 const LANGUAGE_KEY = 'puf-puf-language';
 const MUSIC_KEY = 'puf-puf-music-enabled';
 const SFX_KEY = 'bubblefin-sfx-enabled';
@@ -288,7 +980,7 @@ const UI = {
     tagline: 'Renkleri birleştir, balonları patlat,\nbalon balıklarını okyanusa kavuştur.', continue: 'DEVAM ET',
     start: 'MACERAYA BAŞLA', level: 'Bölüm', levels: 'BÖLÜMLER', settings: 'AYARLAR', oneFinger: 'TEK PARMAK',
     offline: 'İNTERNETSİZ', relaxing: 'RAHATLATICI', adventureMap: 'MACERA HARİTASI', chooseLevel: 'Bölümünü seç',
-    world: 'DÜNYA', locked: 'Kilitli', colors: 'renk', moves: 'hamle', language: 'Dil', music: 'Müzik', soundEffects: 'Ses efektleri',
+    world: 'DÜNYA', locked: 'Kilitli', available: 'AÇIK', colors: 'renk', moves: 'hamle', language: 'Dil', music: 'Müzik', soundEffects: 'Ses efektleri',
     completedLevel: 'TAMAMLANDI', currentLevel: 'SIRADAKİ BÖLÜM', congratulations: 'TEBRİKLER!',
     congratulationsCopy: 'Muhteşem oynadın! Balon balıklarını özgür bıraktın.', rescued: 'KURTARILDI',
     musicOn: 'Açık', musicOff: 'Kapalı', turkish: 'Türkçe', english: 'English', settingsCopy: 'Oyun deneyimini sana göre ayarla.',
@@ -297,16 +989,16 @@ const UI = {
     rule: 'Komşu balonlarda renkleri topla', targetComplete: 'HEDEF TAMAM!', outOfMoves: 'SINIR AŞILDI',
     boundaryFailedCopy: 'Balonlar güvenli çizginin altında kalmalı.',
     free: 'Balon balıkları özgür!', tryAgain: 'Bir kez daha dene', nextLevel: 'SONRAKİ BÖLÜM', replay: 'TEKRAR OYNA',
-    retry: 'YENİDEN DENE', returnLevels: 'Bölümlere dön', drop: 'Balona veya alt hizasına bas, kaydır ve bırak!',
+    retry: 'YENİDEN DENE', returnLevels: 'Bölümlere dön', drop: 'Oyun alanında istediğin yere bas, kaydır ve bırak!',
     aiming: 'Balonu hizala • parmağını bırakınca düşecek',
-    ready: 'Balona ya da alt hizasına basıp kaydır.', rolling: 'Balonlar serbestçe yuvarlanıyor!',
+    ready: 'Oyun alanında istediğin yere basıp kaydır.', rolling: 'Balonlar serbestçe yuvarlanıyor!',
   },
   en: {
     oceanPuzzle: 'OCEAN PUZZLE', complete: 'DONE', underwaterAdventure: 'UNDERWATER ADVENTURE',
     tagline: 'Merge colors, pop the bubbles,\nand set the pufferfish free.', continue: 'CONTINUE',
     start: 'START ADVENTURE', level: 'Level', levels: 'LEVELS', settings: 'SETTINGS', oneFinger: 'ONE FINGER',
     offline: 'OFFLINE', relaxing: 'RELAXING', adventureMap: 'ADVENTURE MAP', chooseLevel: 'Choose a level',
-    world: 'WORLD', locked: 'Locked', colors: 'colors', moves: 'moves', language: 'Language', music: 'Music', soundEffects: 'Sound effects',
+    world: 'WORLD', locked: 'Locked', available: 'OPEN', colors: 'colors', moves: 'moves', language: 'Language', music: 'Music', soundEffects: 'Sound effects',
     completedLevel: 'COMPLETED', currentLevel: 'NEXT LEVEL', congratulations: 'CONGRATULATIONS!',
     congratulationsCopy: 'Beautifully played! You set the pufferfish free.', rescued: 'RESCUED',
     musicOn: 'On', musicOff: 'Off', turkish: 'Türkçe', english: 'English', settingsCopy: 'Tune the game experience your way.',
@@ -315,9 +1007,9 @@ const UI = {
     rule: 'Collect matching colors in neighboring bubbles', targetComplete: 'TARGET COMPLETE!', outOfMoves: 'LIMIT CROSSED',
     boundaryFailedCopy: 'Keep every bubble below the safety line.',
     free: 'Pufferfish are free!', tryAgain: 'Try once more', nextLevel: 'NEXT LEVEL', replay: 'PLAY AGAIN',
-    retry: 'TRY AGAIN', returnLevels: 'Back to levels', drop: 'Hold the bubble or its lane, drag and release!',
+    retry: 'TRY AGAIN', returnLevels: 'Back to levels', drop: 'Touch anywhere on the board, drag and release!',
     aiming: 'Line up the bubble • release to drop',
-    ready: 'Hold the bubble or its lane to aim.', rolling: 'The bubbles are rolling freely!',
+    ready: 'Touch anywhere on the board to aim.', rolling: 'The bubbles are rolling freely!',
   },
 } as const;
 
@@ -325,8 +1017,8 @@ const TUTORIALS = {
   tr: [
     {
       eyebrow: 'ALIŞTIRMA 1 / 3', title: 'Balonu bırak',
-      body: 'Üstteki balona veya balonun altındaki dikey hizaya basılı tut. Sağa-sola sürükleyip aynı rengin üzerine bırak.',
-      hint: 'Balona ya da alt hizasına bas, kaydır ve bırak.', action: 'OYNA',
+      body: 'Oyun alanında istediğin yere basılı tut. Balon parmağına gelir; sağa-sola sürükleyip aynı rengin üzerine bırak.',
+      hint: 'Alana bas, balonu hizala ve bırak.', action: 'OYNA',
     },
     {
       eyebrow: 'ALIŞTIRMA 2 / 3', title: 'Aynı renkleri eşleştir',
@@ -342,8 +1034,8 @@ const TUTORIALS = {
   en: [
     {
       eyebrow: 'PRACTICE 1 / 3', title: 'Drop the bubble',
-      body: 'Hold the bubble or anywhere in its vertical lane. Drag left or right and release above the matching color.',
-      hint: 'Hold the bubble or its lane, line up, and release.', action: 'PLAY',
+      body: 'Touch and hold anywhere on the board. The bubble moves to your finger; drag and release above the matching color.',
+      hint: 'Touch the board, line up, and release.', action: 'PLAY',
     },
     {
       eyebrow: 'PRACTICE 2 / 3', title: 'Match the colors',
@@ -374,8 +1066,9 @@ const COLOR_LABELS: Record<Language, Record<CreatureType, string>> = {
   tr: { berry: 'Pembe', coral: 'Turuncu', sun: 'Sarı', mint: 'Yeşil', aqua: 'Turkuaz', sky: 'Mavi', plum: 'Mor', navy: 'Siyah' },
   en: { berry: 'Pink', coral: 'Orange', sun: 'Yellow', mint: 'Green', aqua: 'Turquoise', sky: 'Blue', plum: 'Purple', navy: 'Black' },
 };
-const LEVELS_PER_PAGE = 50;
-const TOTAL_LEVELS = 800;
+const LEVELS_PER_PAGE = 20;
+const TOTAL_LEVELS = 100;
+const ALL_LEVELS_OPEN = true;
 const WORLD_NAMES = ['Mercan Bahçesi', 'Köpük Koyu', 'İnci Akıntısı', 'Safir Derinlik', 'Ayışığı Resifi', 'Batık Gemi', 'Kristal Mağara', 'Fırtına Geçidi', 'Yıldız Lagünü', 'Okyanus Kapısı'];
 const WORLD_SUBTITLES = ['Renkleri öğren', 'Akıntıyı yönet', 'Sürüleri ayır', 'Derinlere ilerle', 'Zincirler kur', 'Engelleri aş', 'Dar geçitleri çöz', 'Dengeyi koru', 'Usta birleşmeler yap', 'Okyanusu özgür bırak'];
 const WORLD_NAMES_EN = ['Coral Garden', 'Bubble Cove', 'Pearl Current', 'Sapphire Depths', 'Moonlight Reef', 'Sunken Ship', 'Crystal Cave', 'Storm Passage', 'Star Lagoon', 'Ocean Gate'];
@@ -402,10 +1095,14 @@ function buildLevels(): Level[] {
     if (index < tutorials.length) return tutorials[index] as Level;
     const world = Math.floor(index / LEVELS_PER_PAGE);
     const stage = index % LEVELS_PER_PAGE;
-    const paletteSize = Math.min(ALL_COLORS.length, 3 + Math.floor((index - 3) / 20));
+    const paletteSize = Math.min(ALL_COLORS.length, 3 + Math.floor((index - 3) / 12));
     const paletteOffset = Math.floor(world / 3) % ALL_COLORS.length;
     const palette = Array.from({ length: paletteSize }, (_, colorIndex) => ALL_COLORS[(paletteOffset + colorIndex) % ALL_COLORS.length] as CreatureType);
-    const seedCount = Math.min(20, 8 + Math.floor(world / 2) + (stage % 4));
+    // The first obstacle showcase keeps most of the arena visible. Players can
+    // watch each mechanism work before denser piles return from level 21 on.
+    const seedCount = index < 20
+      ? 3 + (stage % 3)
+      : Math.min(9, 5 + Math.floor(world / 2) + (stage % 3));
     const seed: Array<[number, number, CreatureType]> = Array.from({ length: seedCount }, (__, seedIndex) => {
       const row = 7 - Math.floor(seedIndex / COLS);
       const col = seedIndex % COLS;
@@ -416,9 +1113,9 @@ function buildLevels(): Level[] {
       id: index + 1,
       name: worldNameForPage(world, 'tr'),
       subtitle: worldSubtitleForPage(world, 'tr'),
-      moves: 18 + Math.min(34, world * 2 + Math.floor(stage / 5)),
-      goal: Math.min(140, 18 + world * 7 + Math.floor(stage / 3) * 2),
-      merge: 7 + Math.min(4, Math.floor(index / 160)),
+      moves: 16 + Math.min(18, world * 2 + Math.floor(stage / 5)),
+      goal: Math.min(48, 12 + world * 5 + Math.floor(stage / 4) * 3),
+      merge: 6 + Math.min(2, Math.floor(index / 40)),
       palette,
       seed,
     };
@@ -430,7 +1127,7 @@ const LEVELS: Level[] = buildLevels();
 if (__DEV__) {
   const ids = new Set(LEVELS.map(level => level.id));
   if (LEVELS.length !== TOTAL_LEVELS || ids.size !== TOTAL_LEVELS) {
-    throw new Error('Level catalog must contain 800 unique levels.');
+    throw new Error(`Level catalog must contain ${TOTAL_LEVELS} unique levels.`);
   }
   if (LEVELS.slice(0, 3).some((level, index) => level.tutorial !== index + 1 || level.palette.length !== index + 1)) {
     throw new Error('The first three tutorial levels must introduce one color at a time.');
@@ -473,15 +1170,16 @@ const dominantType = (contents: CreatureType[], fallback: CreatureType): Creatur
 };
 
 function makeSeed(level: Level): Piece[] {
-  const boardLayout = boardLayoutForLevel(level.id);
+  const boardLayout = boardLayoutAtTime(boardLayoutForLevel(level.id), 0);
   const seedColumns = 4;
   const columnOrders = new Map<number, number[]>();
   const randomizedPieces: Piece[] = level.seed.map(([row, col, type], index) => {
     const amount = 3 + ((row + col + index) % 3);
     const contents = Array.from({ length: amount }, () => type);
     const size = bubbleSizeForCount(amount);
-    const wallInset = BOARD_WALL_INSET;
     const layer = Math.floor(index / seedColumns);
+    const estimatedCenterY = BOARD_HEIGHT - FLOOR_CLEARANCE - layer * BUBBLE_SIZE * 0.82;
+    const wallInset = wallContactInsetAt(boardLayout, estimatedCenterY);
     if (!columnOrders.has(layer)) {
       const order = Array.from({ length: seedColumns }, (_, columnIndex) => columnIndex);
       for (let cursor = order.length - 1; cursor > 0; cursor -= 1) {
@@ -639,7 +1337,7 @@ function sortableContacts(pieces: Piece[]) {
         a.x + a.size / 2 - (b.x + b.size / 2),
         a.y + a.size / 2 - (b.y + b.size / 2),
       );
-      if (distance > ((a.size + b.size) / 2) * 1.035) continue;
+      if (distance > collisionDistanceFor(a, b) + 0.75) continue;
       const shared = ALL_COLORS.filter(color => a.contents.includes(color) && b.contents.includes(color));
       if (!shared.length) continue;
       contacts.push({ a, b });
@@ -852,11 +1550,25 @@ function verifyMergePlanner() {
   if (!anchoredPlan.receivers.has(resting.id) || anchoredPlan.receivers.has(falling.id)) {
     throw new Error('A falling bubble replaced the resting merge anchor.');
   }
+
+  const rainbow = fake('rainbow-power', 0, 0, ['coral', 'coral', 'coral']);
+  rainbow.power = 'rainbow';
+  const rainbowTarget = fake('rainbow-target', close, 0, ['sky', 'sky']);
+  activateRainbowPower(rainbow, rainbowTarget);
+  if (rainbow.power || rainbow.type !== 'sky' || rainbow.contents.some(type => type !== 'sky')) {
+    throw new Error('A rainbow bubble did not adopt the first contacted color.');
+  }
 }
 
-type ObstacleContact = { nx: number; ny: number; penetration: number; obstacle: BoardObstacle };
+type ObstacleContact = {
+  nx: number;
+  ny: number;
+  penetration: number;
+  obstacle: BoardObstacle;
+  impactSpeed?: number;
+};
 
-function obstacleContact(piece: Piece, obstacle: BoardObstacle, tolerance = 0): ObstacleContact | undefined {
+function obstacleContact(piece: Pick<Piece, 'x' | 'y' | 'size'>, obstacle: BoardObstacle, tolerance = 0): ObstacleContact | undefined {
   const radians = obstacle.angle * Math.PI / 180;
   const axisX = Math.cos(radians);
   const axisY = Math.sin(radians);
@@ -881,32 +1593,271 @@ function obstacleContact(piece: Piece, obstacle: BoardObstacle, tolerance = 0): 
   return { nx, ny, penetration: Math.max(0, collisionDistance - rawDistance), obstacle };
 }
 
+function layoutHasClearDropLane(layout: BoardLayout) {
+  const diameter = bubbleSizeForCount(12);
+  const radius = diameter / 2;
+  const minCenterX = BOARD_WALL_INSET + radius + BUBBLE_GAP;
+  const maxCenterX = BOARD_WIDTH - BOARD_WALL_INSET - radius - BUBBLE_GAP;
+  for (let centerX = minCenterX; centerX <= maxCenterX; centerX += 3) {
+    const lowestCenterY = floorSurfaceAt(layout, centerX) - radius;
+    let clear = true;
+    for (let centerY = HELD_BUBBLE_TOP + radius; centerY <= lowestCenterY; centerY += 5) {
+      const probe = { x: centerX - radius, y: centerY - radius, size: diameter };
+      const wallInset = wallContactInsetAt(layout, centerY);
+      if (centerX < wallInset + radius + 6 || centerX > BOARD_WIDTH - wallInset - radius - 6) {
+        clear = false;
+        break;
+      }
+      // Keep a little steering room in addition to the complete diameter. A
+      // mathematically exact one-pixel route is not a fair playable passage.
+      if (layout.obstacles.some(obstacle => obstacleContact(probe, obstacle, 6))) {
+        clear = false;
+        break;
+      }
+    }
+    if (clear) return true;
+  }
+
+  // Multi-obstacle boards intentionally ask the player to steer around a
+  // staggered gate, so a perfectly vertical lane is not always expected. Run a
+  // second geometric search that allows the full-size bubble to weave through
+  // the chamber while retaining a fair four-pixel cushion on every surface.
+  const routeStep = 6;
+  const startY = HELD_BUBBLE_TOP + radius;
+  const isOpen = (centerX: number, centerY: number) => {
+    const wallInset = wallContactInsetAt(layout, centerY);
+    if (centerX < wallInset + radius + 4 || centerX > BOARD_WIDTH - wallInset - radius - 4) return false;
+    if (centerY < startY - routeStep || centerY > floorSurfaceAt(layout, centerX) - radius + 0.5) return false;
+    const probe = { x: centerX - radius, y: centerY - radius, size: diameter };
+    return !layout.obstacles.some(obstacle => obstacleContact(probe, obstacle, 4));
+  };
+  const queue: Array<{ x: number; y: number }> = [];
+  const visited = new Set<string>();
+  for (let centerX = minCenterX; centerX <= maxCenterX; centerX += routeStep) {
+    if (!isOpen(centerX, startY)) continue;
+    const point = { x: centerX, y: startY };
+    queue.push(point);
+    visited.add(`${Math.round(centerX / routeStep)}:0`);
+  }
+  const directions = [
+    [-1, -1], [0, -1], [1, -1],
+    [-1, 0], [1, 0],
+    [-1, 1], [0, 1], [1, 1],
+  ] as const;
+  let cursor = 0;
+  while (cursor < queue.length) {
+    const point = queue[cursor] as { x: number; y: number };
+    cursor += 1;
+    if (floorSurfaceAt(layout, point.x) - radius - point.y <= routeStep * 1.5) return true;
+    directions.forEach(([dx, dy]) => {
+      const nextX = point.x + dx * routeStep;
+      const nextY = point.y + dy * routeStep;
+      const key = `${Math.round(nextX / routeStep)}:${Math.round((nextY - startY) / routeStep)}`;
+      if (visited.has(key) || !isOpen(nextX, nextY)) return;
+      visited.add(key);
+      queue.push({ x: nextX, y: nextY });
+    });
+  }
+  return false;
+}
+
+function verifyBoardLayoutRoutes() {
+  // Validate several complete 24-layout cycles, including every phase and
+  // direction variation used by moving obstacles. This fails loudly in dev if
+  // a visual design ever closes every playable route.
+  for (let levelId = 1; levelId <= 120; levelId += 1) {
+    const layout = boardLayoutForLevel(levelId);
+    for (const timeSeconds of [0, 1.25, 2.5, 3.75]) {
+      if (!layoutHasClearDropLane(boardLayoutAtTime(layout, timeSeconds))) {
+        throw new Error(`Board layout ${levelId} blocks every full-size bubble route at ${timeSeconds}s.`);
+      }
+    }
+  }
+
+  const expectedVisuals: ObstacleVisualKind[] = ['ramp', 'clam', 'anchor', 'piston', 'wheel', 'flap', 'crate'];
+  const showcaseLayouts = Array.from({ length: 17 }, (_, index) => boardLayoutForLevel(index + 4));
+  const showcaseVisuals = new Set(showcaseLayouts.flatMap(layout =>
+    layout.obstacles.map(obstacle => obstacle.visual).filter(Boolean) as ObstacleVisualKind[],
+  ));
+  expectedVisuals.forEach(visual => {
+    if (!showcaseVisuals.has(visual)) throw new Error(`The first 20 levels do not showcase the ${visual} obstacle.`);
+  });
+  if (!showcaseLayouts.some(layout => layout.currents.some(current => current.kind === 'vortex'))) {
+    throw new Error('The first 20 levels do not showcase a vortex.');
+  }
+  for (let levelId = 4; levelId <= 11; levelId += 1) {
+    const layout = boardLayoutForLevel(levelId);
+    const systems = new Set([
+      ...layout.obstacles.map(obstacle => obstacle.visual).filter(Boolean),
+      ...layout.currents.map(current => current.kind),
+    ]);
+    if (systems.size !== 1) throw new Error(`Showcase level ${levelId} must teach exactly one obstacle system.`);
+  }
+  for (let levelId = 12; levelId <= 20; levelId += 1) {
+    const layout = boardLayoutForLevel(levelId);
+    const systems = new Set([
+      ...layout.obstacles.map(obstacle => obstacle.visual).filter(Boolean),
+      ...layout.currents.map(current => current.kind),
+    ]);
+    if (systems.size < 2) throw new Error(`Combination level ${levelId} must use at least two obstacle systems.`);
+  }
+  if (LEVELS.slice(3, 20).some(level => level.seed.length > 6)) {
+    throw new Error('The first obstacle showcase starts with too many bubbles.');
+  }
+  const crateObstacle = boardLayoutForLevel(11).obstacles.find(obstacle => obstacle.visual === 'crate');
+  if (crateObstacle?.breakHits !== 2) throw new Error('The showcase crate is not configured to break after two hits.');
+  const wheelObstacles = boardLayoutForLevel(8).obstacles.filter(obstacle => obstacle.visual === 'wheel');
+  if (wheelObstacles.length !== 1 || Math.abs((wheelObstacles[0]?.length ?? 0) - (wheelObstacles[0]?.thickness ?? 1)) > 0.01) {
+    throw new Error('The showcase wheel must use one stable circular collider.');
+  }
+  const pilotMissionLevels = [5, 7, 8, 9, 10, 11];
+  if (pilotMissionLevels.some(levelId => !PILOT_MISSIONS[levelId] || (PILOT_MISSIONS[levelId]?.target ?? 0) < 1)) {
+    throw new Error('The early fun-system pilot is missing a playable side mission.');
+  }
+}
+
 function resolveObstacleCollision(piece: Piece, obstacle: BoardObstacle, applyBounce = true) {
   const contact = obstacleContact(piece, obstacle);
   if (!contact) return undefined;
+  if (obstacle.role === 'boundary') {
+    const inwardX = obstacle.cx < BOARD_WIDTH / 2 ? 1 : -1;
+    // Decorative ledges attached to a side wall may only push toward the
+    // playable area. A reverse normal would squeeze the bubble into the rail.
+    if (contact.nx * inwardX < 0) {
+      contact.nx = inwardX;
+      contact.ny = 0;
+    }
+  }
   piece.x += contact.nx * contact.penetration;
   piece.y += contact.ny * contact.penetration;
+  const centerX = piece.x + piece.size / 2;
+  const centerY = piece.y + piece.size / 2;
+  const omega = obstacle.angularVelocity ?? 0;
+  const surfaceVx = (obstacle.velocityX ?? 0) - omega * (centerY - obstacle.cy);
+  const surfaceVy = (obstacle.velocityY ?? 0) + omega * (centerX - obstacle.cx);
+  const relativeNormalVelocity = (piece.vx - surfaceVx) * contact.nx + (piece.vy - surfaceVy) * contact.ny;
+  const impactSpeed = Math.max(0, -relativeNormalVelocity) * (piece.power === 'heavy' ? 1.65 : 1);
+  const surfaceSpeed = Math.hypot(surfaceVx, surfaceVy);
+  if (obstacle.motion && (
+    relativeNormalVelocity < -0.08
+    || (surfaceSpeed > 0.035 && contact.penetration > 0.22)
+  )) {
+    piece.sleeping = false;
+    piece.settleFrames = 0;
+    piece.contactFrames = 0;
+  }
   if (applyBounce) {
-    const normalVelocity = piece.vx * contact.nx + piece.vy * contact.ny;
-    if (normalVelocity < 0) {
-      piece.vx -= normalVelocity * contact.nx * 1.2;
-      piece.vy -= normalVelocity * contact.ny * 1.2;
+    if (relativeNormalVelocity < 0) {
+      const restitution = obstacle.reaction === 'spring' ? 0.78 : obstacle.motion ? 0.24 : 0.2;
+      const bounceThreshold = obstacle.reaction === 'spring' ? 0.18 : 0.65;
+      // Tiny repeated contacts used to reverse the velocity every frame. Match
+      // the surface speed at low energy and reserve a rebound for real hits.
+      const impulse = Math.abs(relativeNormalVelocity) >= bounceThreshold
+        ? -(1 + restitution) * relativeNormalVelocity
+        : -relativeNormalVelocity;
+      piece.vx += impulse * contact.nx;
+      piece.vy += impulse * contact.ny;
+      if (obstacle.reaction === 'spring' && Math.abs(relativeNormalVelocity) >= bounceThreshold) {
+        piece.vx += contact.nx * 0.38;
+        piece.vy += contact.ny * 0.38;
+      }
     }
     piece.vx *= 0.985;
     piece.vy *= 0.965;
+    piece.vx = Math.max(-16, Math.min(16, piece.vx));
+    piece.vy = Math.max(-16, Math.min(16, piece.vy));
   }
-  return contact;
+  return { ...contact, impactSpeed };
+}
+
+function activateRainbowPower(rainbow: Piece, other: Piece) {
+  if (rainbow.power !== 'rainbow' || other.power === 'rainbow' || !other.contents.length) return;
+  const targetType = dominantType(other.contents, other.type);
+  rainbow.type = targetType;
+  rainbow.contents = Array.from({ length: rainbow.contents.length }, () => targetType);
+  rainbow.count = rainbow.contents.length;
+  rainbow.power = undefined;
+}
+
+function pairCorrectionShares(a: Piece, b: Piece) {
+  // A sleeping bubble is stable, not an immovable wall. Let it yield a little
+  // when another bubble presses into it; otherwise the moving bubble gets
+  // trapped between two rigid neighbours and oscillates forever.
+  if (a.sleeping && b.sleeping) return { aShare: 0.5, bShare: 0.5 };
+  const aMobility = a.sleeping ? 0.18 : 1;
+  const bMobility = b.sleeping ? 0.18 : 1;
+  const total = aMobility + bMobility;
+  return { aShare: aMobility / total, bShare: bMobility / total };
+}
+
+const pairContactSlop = (a: Piece, b: Piece) =>
+  a.sleeping && b.sleeping ? RESTING_CONTACT_SLOP : CONTACT_SLOP;
+
+function currentForceForPiece(piece: Piece, layout: BoardLayout) {
+  const centerX = piece.x + piece.size / 2;
+  const centerY = piece.y + piece.size / 2;
+  let forceX = 0;
+  let forceY = 0;
+  let velocityRetention = 1;
+  (layout.currents ?? []).forEach(current => {
+    const radiusX = Math.max(1, current.width / 2);
+    const radiusY = Math.max(1, current.height / 2);
+    const normalizedX = (centerX - current.cx) / radiusX;
+    const normalizedY = (centerY - current.cy) / radiusY;
+    const ellipseDistance = normalizedX * normalizedX + normalizedY * normalizedY;
+    if (ellipseDistance >= 1) return;
+    const falloff = Math.max(0.12, (1 - ellipseDistance) ** 0.7);
+    if (current.kind === 'stream') {
+      const radians = (current.angle ?? 0) * Math.PI / 180;
+      forceX += Math.cos(radians) * current.strength * falloff;
+      forceY += Math.sin(radians) * current.strength * falloff;
+      velocityRetention = Math.min(velocityRetention, 0.988);
+      return;
+    }
+    const dx = centerX - current.cx;
+    const dy = centerY - current.cy;
+    const rawDistance = Math.hypot(dx, dy);
+    const distance = Math.max(8, rawDistance);
+    // At the exact centre there is no geometric tangent. Use the bubble phase
+    // as a stable fallback so the vortex never develops a dead spot.
+    const radialX = rawDistance < 8 ? Math.cos(piece.phase) * 8 : dx;
+    const radialY = rawDistance < 8 ? Math.sin(piece.phase) * 8 : dy;
+    const direction = current.clockwise ? 1 : -1;
+    forceX += (-radialY / distance) * current.strength * direction * falloff;
+    forceY += (radialX / distance) * current.strength * direction * falloff;
+    // A gentle pull keeps the bubble inside the swirl long enough for the
+    // player to read and use it, without trapping it permanently.
+    forceX += (-radialX / distance) * current.strength * 0.28 * falloff;
+    forceY += (-radialY / distance) * current.strength * 0.28 * falloff;
+    velocityRetention = Math.min(velocityRetention, 0.94);
+  });
+  const magnitude = Math.hypot(forceX, forceY);
+  if (magnitude > 0.34) {
+    const scale = 0.34 / magnitude;
+    return { x: forceX * scale, y: forceY * scale, velocityRetention };
+  }
+  return { x: forceX, y: forceY, velocityRetention };
 }
 
 function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT) {
-  const wallInset = BOARD_WALL_INSET;
   const next = pieces;
   const colorContactKeys = new Set<string>();
+  const obstacleImpacts = new Set<string>();
   next.forEach(piece => {
     // Fast Refresh can preserve Piece objects created by an older bundle.
     // Upgrade them in place before the new internal-creature animation runs.
     ensureCreatureMotion(piece);
+    const currentForce = currentForceForPiece(piece, layout);
+    if (piece.sleeping && Math.hypot(currentForce.x, currentForce.y) > 0.025) {
+      piece.sleeping = false;
+      piece.settleFrames = 0;
+      piece.contactFrames = 0;
+    }
     if (!piece.sleeping) {
+      piece.vx *= currentForce.velocityRetention;
+      piece.vy *= currentForce.velocityRetention;
+      piece.vx += currentForce.x;
+      piece.vy += currentForce.y;
       piece.x += piece.vx;
       piece.y += piece.vy;
       const fallingDrift = Math.min(1, Math.abs(piece.vy) / 5);
@@ -926,26 +1877,47 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
 
   next.forEach(piece => {
     const floor = floorTopForPiece(piece, layout);
+    const wallInset = wallContactInsetAt(layout, piece.y + piece.size / 2);
     if (piece.x < wallInset) {
       piece.x = wallInset;
-      piece.vx = Math.abs(piece.vx) * 0.58;
+      const impact = Math.max(0, -piece.vx);
+      if (impact > 0.75) piece.vx = impact * 0.42;
+      else if (piece.vx < 0) piece.vx = 0;
     } else if (piece.x > BOARD_WIDTH - piece.size - wallInset) {
       piece.x = BOARD_WIDTH - piece.size - wallInset;
-      piece.vx = -Math.abs(piece.vx) * 0.58;
+      const impact = Math.max(0, piece.vx);
+      if (impact > 0.75) piece.vx = -impact * 0.42;
+      else if (piece.vx > 0) piece.vx = 0;
     }
     if (piece.y < -piece.size * 0.62 && piece.vy < 0) {
       piece.y = -piece.size * 0.62;
       piece.vy = 0;
     } else if (piece.y > floor) {
       piece.y = floor;
-      const impact = Math.abs(piece.vy);
+      const impact = Math.max(0, piece.vy);
+      const localFloorGradient = floorGradientForPiece(piece, layout);
+      const steepRoundContact = layout.arenaShape === 'round' && Math.abs(localFloorGradient) > 0.35;
       // One clearly visible but quickly damped hop: a fast drop rises only a
       // few pixels, then the next contact settles instead of vibrating.
-      piece.vy = impact > 1.6 ? -Math.min(3.6, impact * 0.3) : 0;
-      piece.vx *= 0.91;
-      if (Math.abs(piece.vx) < 0.025) piece.vx = 0;
+      if (steepRoundContact) {
+        // At the side of the U-shaped bowl, vertical rebound repeatedly fights
+        // the wall constraint. Convert that energy into one smooth inward roll.
+        piece.vy = 0;
+        piece.vx += Math.sign(localFloorGradient) * Math.min(1.8, impact * 0.12);
+      } else if (impact > 3.2) piece.vy = -Math.min(3, impact * 0.22);
+      else if (piece.vy > 0) piece.vy = 0;
+      piece.vx *= 0.86;
+      if (Math.abs(piece.vx) < 0.06) piece.vx = 0;
     }
-    layout.obstacles.forEach(obstacle => resolveObstacleCollision(piece, obstacle));
+    layout.obstacles.forEach(obstacle => {
+      const contact = resolveObstacleCollision(piece, obstacle);
+      if (!contact || (!obstacle.motion && obstacle.reaction !== 'spring' && !obstacle.breakHits)) return;
+      // A resting bubble remains in contact for many frames. Treat only the
+      // first meaningful hit as a visual impact; replaying the squash animation
+      // for every support frame made moving obstacles visibly vibrate.
+      const impactThreshold = obstacle.reaction === 'spring' ? 0.3 : obstacle.breakHits ? 0.7 : 0.85;
+      if ((contact.impactSpeed ?? 0) >= impactThreshold) obstacleImpacts.add(obstacle.id);
+    });
   });
 
   const removed = new Set<string>();
@@ -955,7 +1927,16 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
       const a = next[i] as Piece;
       const b = next[j] as Piece;
       if (removed.has(b.id)) continue;
-      if (a.sleeping && b.sleeping) continue;
+      // Two settled bubbles were already separated before going to sleep.
+      // Re-solving the same resting pair on every moving-obstacle frame is both
+      // expensive and the main source of sub-pixel pile vibration.
+      if (a.sleeping && b.sleeping) {
+        const restingDistance = Math.hypot(
+          b.x + b.size / 2 - (a.x + a.size / 2),
+          b.y + b.size / 2 - (a.y + a.size / 2),
+        );
+        if (restingDistance >= (a.size + b.size) / 2) continue;
+      }
       const ax = a.x + a.size / 2;
       const ay = a.y + a.size / 2;
       const bx = b.x + b.size / 2;
@@ -970,16 +1951,19 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
       const ny = rawDistance < 0.01 ? 0 : dy / distance;
       const overlap = collisionDistance - distance;
       const relative = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+      activateRainbowPower(a, b);
+      activateRainbowPower(b, a);
       const matchingContact = a.contents.some(color => b.contents.includes(color));
       if (matchingContact) colorContactKeys.add(colorContactKey(a, b));
-      const aShare = a.sleeping && !b.sleeping ? 0 : b.sleeping && !a.sleeping ? 1 : 0.5;
-      const bShare = 1 - aShare;
-      a.x -= nx * overlap * aShare;
-      a.y -= ny * overlap * aShare;
-      b.x += nx * overlap * bShare;
-      b.y += ny * overlap * bShare;
+      const { aShare, bShare } = pairCorrectionShares(a, b);
+      const positionCorrection = Math.max(0, overlap - pairContactSlop(a, b));
+      a.x -= nx * positionCorrection * aShare;
+      a.y -= ny * positionCorrection * aShare;
+      b.x += nx * positionCorrection * bShare;
+      b.y += ny * positionCorrection * bShare;
       if (relative < 0) {
-        const impulse = -(1 + (matchingContact ? 0 : 0.12)) * relative;
+        const restitution = !matchingContact && Math.abs(relative) > 1.2 ? 0.08 : 0;
+        const impulse = -(1 + restitution) * relative;
         if (a.sleeping && !b.sleeping) {
           b.vx += impulse * nx;
           b.vy += impulse * ny;
@@ -996,12 +1980,16 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
     }
   }
   const result = removed.size ? next.filter(piece => !removed.has(piece.id)) : next;
-  for (let pass = 0; pass < 6; pass += 1) {
+  for (let pass = 0; pass < POSITION_SOLVER_PASSES; pass += 1) {
     let correctedOverlap = false;
+    let correctedBoundary = false;
     for (let i = 0; i < result.length; i += 1) {
       for (let j = i + 1; j < result.length; j += 1) {
         const a = result[i] as Piece;
         const b = result[j] as Piece;
+        // The first collision pass above already repairs any actual visible
+        // overlap between sleeping pieces. Do not repeat square roots for those
+        // same inert pairs in every iterative solver pass.
         if (a.sleeping && b.sleeping) continue;
         const dx = b.x + b.size / 2 - (a.x + a.size / 2);
         const dy = b.y + b.size / 2 - (a.y + a.size / 2);
@@ -1009,12 +1997,12 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
         const distance = Math.max(0.01, rawDistance);
         const collisionDistance = collisionDistanceFor(a, b);
         if (distance >= collisionDistance) continue;
+        const correction = Math.max(0, collisionDistance - distance - pairContactSlop(a, b));
+        if (correction <= 0) continue;
         correctedOverlap = true;
-        const correction = collisionDistance - distance;
         const nx = rawDistance < 0.01 ? (i + j) % 2 ? 1 : -1 : dx / distance;
         const ny = rawDistance < 0.01 ? 0 : dy / distance;
-        const aShare = a.sleeping && !b.sleeping ? 0 : b.sleeping && !a.sleeping ? 1 : 0.5;
-        const bShare = 1 - aShare;
+        const { aShare, bShare } = pairCorrectionShares(a, b);
         a.x -= nx * correction * aShare;
         a.y -= ny * correction * aShare;
         b.x += nx * correction * bShare;
@@ -1022,12 +2010,26 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
       }
     }
     result.forEach(piece => {
+      const beforeX = piece.x;
+      const beforeY = piece.y;
       const floor = floorTopForPiece(piece, layout);
+      const wallInset = wallContactInsetAt(layout, piece.y + piece.size / 2);
       piece.x = Math.max(wallInset, Math.min(BOARD_WIDTH - piece.size - wallInset, piece.x));
       piece.y = Math.min(floor, piece.y);
-      layout.obstacles.forEach(obstacle => resolveObstacleCollision(piece, obstacle, false));
+      layout.obstacles.forEach(obstacle => {
+        const contact = resolveObstacleCollision(piece, obstacle, false);
+        if (contact && contact.penetration > CONTACT_SLOP) correctedBoundary = true;
+      });
+      // An obstacle close to a rail is not allowed to project a bubble through
+      // the frame. Re-apply the arena constraint after obstacle projection.
+      const correctedWallInset = wallContactInsetAt(layout, piece.y + piece.size / 2);
+      piece.x = Math.max(correctedWallInset, Math.min(BOARD_WIDTH - piece.size - correctedWallInset, piece.x));
+      piece.y = Math.min(floorTopForPiece(piece, layout), piece.y);
+      if (Math.abs(piece.x - beforeX) > CONTACT_SLOP || Math.abs(piece.y - beforeY) > CONTACT_SLOP) {
+        correctedBoundary = true;
+      }
     });
-    if (!correctedOverlap) break;
+    if (!correctedOverlap && !correctedBoundary) break;
   }
 
   const supported = new Set<string>();
@@ -1066,6 +2068,7 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
   }
   result.forEach(piece => {
     const floor = floorTopForPiece(piece, layout);
+    const wallInset = wallContactInsetAt(layout, piece.y + piece.size / 2);
     piece.x = Math.max(wallInset, Math.min(BOARD_WIDTH - piece.size - wallInset, piece.x));
     piece.y = Math.min(floor, piece.y);
     if (!supported.has(piece.id)) {
@@ -1101,9 +2104,18 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
     const hasRightSupport = lowerContacts.some(other => other.x + other.size / 2 > centerX + 2);
     const againstLeftWall = piece.x <= wallInset + 1;
     const againstRightWall = piece.x >= BOARD_WIDTH - piece.size - wallInset - 1;
-    const floorDownhill = Math.sign(layout.floorSlope);
+    const localFloorGradient = floorGradientForPiece(piece, layout);
+    const localFloorTilt = Math.abs(localFloorGradient) * BOARD_WIDTH;
+    const floorDownhill = Math.sign(localFloorGradient);
     const floorSlopeBlocked = floorDownhill < 0 ? againstLeftWall : floorDownhill > 0 ? againstRightWall : true;
-    const slopedFloorSliding = onFloor && Math.abs(layout.floorSlope) > 2 && !floorSlopeBlocked && lowerContacts.length === 0;
+    // The circular floor is mathematically sloped even a fraction of a pixel
+    // away from its centre. Give that lowest pocket a wider neutral zone so a
+    // settled bubble does not endlessly cross the centre and jitter.
+    const floorSlideThreshold = layout.arenaShape === 'round' ? 24 : 2;
+    const slopedFloorSliding = onFloor
+      && localFloorTilt > floorSlideThreshold
+      && !floorSlopeBlocked
+      && lowerContacts.length === 0;
     const obstacleRadians = supportingObstacle ? supportingObstacle.angle * Math.PI / 180 : 0;
     const obstacleDownhill = supportingObstacle
       ? Math.sign(Math.sin(obstacleRadians)) * Math.sign(Math.cos(obstacleRadians) || 1)
@@ -1114,7 +2126,7 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
       && !obstacleSlopeBlocked
       && lowerContacts.length === 0;
     const stablePocket = (onFloor && !slopedFloorSliding)
-      || (Boolean(supportingObstacle) && !obstacleSliding)
+      || (Boolean(supportingObstacle) && !supportingObstacle?.motion && !obstacleSliding)
       || (hasLeftSupport && hasRightSupport)
       || ((againstLeftWall || againstRightWall) && lowerContacts.length > 0);
     const loadWeight = upperContacts.reduce((sum, other) => sum + Math.max(1, other.contents.length / 3), 0);
@@ -1187,7 +2199,10 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
       piece.contactFrames = 0;
     }
     if (slopedFloorSliding) {
-      piece.vx += floorDownhill * Math.min(0.14, 0.055 + Math.abs(layout.floorSlope) * 0.0025);
+      const slopeAcceleration = layout.arenaShape === 'round'
+        ? Math.min(0.09, 0.035 + localFloorTilt * 0.0012)
+        : Math.min(0.14, 0.055 + localFloorTilt * 0.0025);
+      piece.vx += floorDownhill * slopeAcceleration;
       piece.vx = Math.max(-3.2, Math.min(3.2, piece.vx));
       piece.contactFrames = 0;
     }
@@ -1214,8 +2229,8 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
       piece.sleeping = true;
       piece.vx = 0;
       piece.vy = 0;
-      piece.x = Math.round(piece.x * 20) / 20;
-      piece.y = Math.round(piece.y * 20) / 20;
+      piece.x = Math.round(piece.x * 100) / 100;
+      piece.y = Math.round(piece.y * 100) / 100;
       piece.settleFrames = 1;
     } else {
       piece.sleeping = false;
@@ -1237,7 +2252,7 @@ function stepPhysics(pieces: Piece[], layout: BoardLayout = DEFAULT_BOARD_LAYOUT
       if (Math.abs(piece.creatureAngle) < 0.025) piece.creatureAngle = 0;
     }
   });
-  return { pieces: result, structureChanged: removed.size > 0, colorContactKeys };
+  return { pieces: result, structureChanged: removed.size > 0, colorContactKeys, obstacleImpacts };
 }
 
 function verifyPhysicsStability() {
@@ -1254,7 +2269,10 @@ function verifyPhysicsStability() {
     type: 'coral', count: 3, contents: ['coral', 'coral', 'coral'],
     sleeping, settleFrames: sleeping ? 5 : 0,
   });
-  const floorY = BOARD_HEIGHT - BUBBLE_SIZE - FLOOR_CLEARANCE;
+  const floorY = floorTopForPiece(
+    { x: BOARD_WIDTH / 2 - BUBBLE_SIZE / 2, size: BUBBLE_SIZE },
+    DEFAULT_BOARD_LAYOUT,
+  );
   const stableDistance = collisionDistanceFor(
     { size: BUBBLE_SIZE } as Piece,
     { size: BUBBLE_SIZE } as Piece,
@@ -1267,6 +2285,62 @@ function verifyPhysicsStability() {
   const end = stableStack.flatMap(piece => [piece.x, piece.y]);
   if (end.some((value, index) => Math.abs(value - (start[index] as number)) > 0.001)) {
     throw new Error('An unloaded resting bubble moved while asleep.');
+  }
+
+  const wallContactInset = wallContactInsetAt(DEFAULT_BOARD_LAYOUT, 90 + BUBBLE_SIZE / 2);
+  const calmWallContact = probe('calm-wall-contact', wallContactInset - 0.2, 90, false);
+  calmWallContact.vx = -0.4;
+  stepPhysics([calmWallContact]);
+  if (calmWallContact.x < wallContactInset || calmWallContact.vx > 0.001) {
+    throw new Error('A low-speed wall contact created a repeated rebound.');
+  }
+
+  const calmFloorContact = probe('calm-floor-contact', BOARD_WIDTH / 2, floorY - 0.2, false);
+  calmFloorContact.vy = 0.45;
+  stepPhysics([calmFloorContact]);
+  if (calmFloorContact.y > floorY + 0.001 || calmFloorContact.vy < -0.001) {
+    throw new Error('A low-speed floor contact created a repeated rebound.');
+  }
+
+  const roundLayout: BoardLayout = {
+    ...DEFAULT_BOARD_LAYOUT,
+    arenaShape: 'round',
+    floorCurve: 76,
+  };
+  const roundResting = probe('round-floor-resting', BOARD_WIDTH / 2 - BUBBLE_SIZE / 2, 0, true);
+  roundResting.y = floorTopForPiece(roundResting, roundLayout);
+  const roundRestingStart = { x: roundResting.x, y: roundResting.y };
+  for (let frame = 0; frame < 120; frame += 1) stepPhysics([roundResting], roundLayout);
+  if (
+    Math.abs(roundResting.x - roundRestingStart.x) > 0.001
+    || Math.abs(roundResting.y - roundRestingStart.y) > 0.001
+  ) {
+    throw new Error('A bubble jittered in the circular floor pocket.');
+  }
+
+  const roundEdgeInset = wallContactInsetAt(roundLayout, BOARD_HEIGHT * 0.6);
+  const roundEdge = probe(
+    'round-edge-roll',
+    BOARD_WIDTH - BUBBLE_SIZE - roundEdgeInset,
+    0,
+    true,
+  );
+  roundEdge.y = floorTopForPiece(roundEdge, roundLayout);
+  const roundEdgeStartX = roundEdge.x;
+  for (let frame = 0; frame < 90; frame += 1) stepPhysics([roundEdge], roundLayout);
+  if (roundEdgeStartX - roundEdge.x < BUBBLE_SIZE * 0.18) {
+    throw new Error('A bubble remained trapped and vibrating at the round-frame corner.');
+  }
+
+  const grownSize = bubbleSizeForCount(12);
+  const constrainedGrowth = constrainResizedPieceToArena(
+    ROUND_PLAYFIELD_INSET - grownSize / 2,
+    floorY,
+    grownSize,
+    roundLayout,
+  );
+  if (constrainedGrowth.x < ROUND_PLAYFIELD_INSET + ROUND_SIDE_FRAME_CLEARANCE - 0.001) {
+    throw new Error('A resized bubble entered the visible round-frame rail.');
   }
 
   const loadedBase = probe('loaded-base', BOARD_WIDTH / 2 - BUBBLE_SIZE / 2, floorY, true);
@@ -1309,8 +2383,36 @@ function verifyPhysicsStability() {
     overlapB.x + overlapB.size / 2 - (overlapA.x + overlapA.size / 2),
     overlapB.y + overlapB.size / 2 - (overlapA.y + overlapA.size / 2),
   );
-  if (separatedDistance < collisionDistanceFor(overlapA, overlapB) - 0.02) {
+  if (separatedDistance < collisionDistanceFor(overlapA, overlapB) - CONTACT_SLOP - 0.02) {
     throw new Error('Bubble surfaces remained intersected after collision resolution.');
+  }
+
+  const sleepingOverlapA = probe('sleeping-overlap-a', BOARD_WIDTH / 2 - BUBBLE_SIZE, floorY, true);
+  const sleepingOverlapB = probe('sleeping-overlap-b', BOARD_WIDTH / 2 - BUBBLE_SIZE * 0.42, floorY, true);
+  stepPhysics([sleepingOverlapA, sleepingOverlapB]);
+  const sleepingSeparatedDistance = Math.hypot(
+    sleepingOverlapB.x + sleepingOverlapB.size / 2 - (sleepingOverlapA.x + sleepingOverlapA.size / 2),
+    sleepingOverlapB.y + sleepingOverlapB.size / 2 - (sleepingOverlapA.y + sleepingOverlapA.size / 2),
+  );
+  const sleepingVisibleContactDistance = (sleepingOverlapA.size + sleepingOverlapB.size) / 2;
+  if (sleepingSeparatedDistance < sleepingVisibleContactDistance + 0.02) {
+    throw new Error('Two sleeping bubble surfaces remained intersected.');
+  }
+  const separatedSleepingPositions = [
+    sleepingOverlapA.x,
+    sleepingOverlapA.y,
+    sleepingOverlapB.x,
+    sleepingOverlapB.y,
+  ];
+  for (let frame = 0; frame < 60; frame += 1) stepPhysics([sleepingOverlapA, sleepingOverlapB]);
+  const settledSleepingPositions = [
+    sleepingOverlapA.x,
+    sleepingOverlapA.y,
+    sleepingOverlapB.x,
+    sleepingOverlapB.y,
+  ];
+  if (settledSleepingPositions.some((value, index) => Math.abs(value - (separatedSleepingPositions[index] as number)) > 0.01)) {
+    throw new Error('Separated sleeping bubbles started jittering again.');
   }
 
   const slideBase = probe('slide-base', BOARD_WIDTH / 2, floorY, true);
@@ -1372,11 +2474,61 @@ function verifyPhysicsStability() {
   if (!obstacleContact(circleProbe, roundBumper)) {
     throw new Error('A round bumper did not collide at its visible edge.');
   }
+
+  const streamLayout: BoardLayout = {
+    ...DEFAULT_BOARD_LAYOUT,
+    currents: [{
+      id: 'physics-stream-probe', kind: 'stream',
+      cx: BOARD_WIDTH / 2, cy: 150, width: 170, height: 130,
+      strength: 0.22, angle: 0,
+    }],
+  };
+  const streamProbe = probe(
+    'stream-force-probe',
+    streamLayout.currents[0]!.cx - BUBBLE_SIZE / 2,
+    streamLayout.currents[0]!.cy - BUBBLE_SIZE / 2,
+    false,
+  );
+  const streamForce = currentForceForPiece(streamProbe, streamLayout);
+  if (streamForce.x < 0.18 || streamForce.velocityRetention >= 1) {
+    throw new Error('A visible current field did not move a bubble in its arrow direction.');
+  }
+
+  const vortexLayout: BoardLayout = {
+    ...DEFAULT_BOARD_LAYOUT,
+    currents: [{
+      id: 'physics-vortex-probe', kind: 'vortex',
+      cx: BOARD_WIDTH / 2, cy: 150, width: 170, height: 170,
+      strength: 0.18, clockwise: true,
+    }],
+  };
+  const vortexProbe = probe(
+    'vortex-force-probe',
+    vortexLayout.currents[0]!.cx + 30 - BUBBLE_SIZE / 2,
+    vortexLayout.currents[0]!.cy - BUBBLE_SIZE / 2,
+    false,
+  );
+  const vortexForce = currentForceForPiece(vortexProbe, vortexLayout);
+  if (Math.hypot(vortexForce.x, vortexForce.y) < 0.12 || vortexForce.velocityRetention > 0.94) {
+    throw new Error('A vortex did not visibly slow and curve a passing bubble.');
+  }
+
+  const visualSpinner: BoardObstacle = {
+    id: 'continuous-visual-spinner', cx: 150, cy: 140,
+    length: 92, thickness: 18, angle: 170, kind: 'pearl',
+    motion: { type: 'rotate', range: 0, speed: 20, phase: 0 },
+  };
+  const beforeWrap = obstacleVisualAngleAtTime(visualSpinner, 0.45);
+  const afterWrap = obstacleVisualAngleAtTime(visualSpinner, 0.55);
+  if (Math.abs(afterWrap - beforeWrap - 2) > 0.001) {
+    throw new Error('A rotating obstacle visual jumped at the 180-degree boundary.');
+  }
 }
 
 if (__DEV__) {
   verifyMergePlanner();
   verifyPhysicsStability();
+  verifyBoardLayoutRoutes();
 }
 
 function commitPhysicsFrame(pieces: Piece[]) {
@@ -1385,8 +2537,8 @@ function commitPhysicsFrame(pieces: Piece[]) {
     if (
       piece.renderedX === undefined
       || piece.renderedY === undefined
-      || Math.abs(piece.x - piece.renderedX) >= 0.03
-      || Math.abs(piece.y - piece.renderedY) >= 0.03
+      || Math.abs(piece.x - piece.renderedX) >= 0.01
+      || Math.abs(piece.y - piece.renderedY) >= 0.01
     ) {
       piece.position.setValue({ x: piece.x, y: piece.y });
       piece.renderedX = piece.x;
@@ -1656,6 +2808,36 @@ function SwimmingPufferfish({
   );
 }
 
+function RestingPufferfish({
+  type,
+  size,
+  bubbleSize,
+  seed,
+  index,
+  count,
+}: {
+  type: CreatureType;
+  size: number;
+  bubbleSize: number;
+  seed: string;
+  index: number;
+  count: number;
+}) {
+  const route = freeSwimRoute(seed, index, count, bubbleSize, size);
+  return (
+    <View
+      style={{
+        position: 'absolute',
+        left: route.center - size * 0.69 + route.x,
+        top: route.center - size * 0.69 + route.y,
+        transform: [{ rotate: route.rotate }],
+      }}
+    >
+      <MiniCreature type={type} size={size} />
+    </View>
+  );
+}
+
 const Bubble = React.memo(function Bubble({
   type,
   count,
@@ -1669,6 +2851,7 @@ const Bubble = React.memo(function Bubble({
   settleInstantly,
   smoothLayout,
   layoutCount,
+  power,
 }: {
   type: CreatureType;
   count: number;
@@ -1682,6 +2865,7 @@ const Bubble = React.memo(function Bubble({
   settleInstantly?: boolean;
   smoothLayout?: boolean;
   layoutCount?: number;
+  power?: BubblePower;
 }) {
   const colors = CREATURES[type];
   const visibleContents = (contents ?? Array.from({ length: count }, () => type)).slice(0, 10);
@@ -1698,6 +2882,20 @@ const Bubble = React.memo(function Bubble({
 
   return (
     <View style={[styles.bubbleFrame, { width: size, height: size, borderRadius: size / 2 }]}>
+    {power && (
+      <View
+        pointerEvents="none"
+        style={[
+          styles.powerBubbleHalo,
+          {
+            borderRadius: size / 2,
+            borderColor: power === 'rainbow' ? '#a45cff' : '#ffb21f',
+          },
+        ]}
+      >
+        <View style={[styles.powerBubbleCore, power === 'rainbow' ? styles.powerBubbleRainbow : styles.powerBubbleHeavy]} />
+      </View>
+    )}
     <View style={[styles.bubble, { width: size, height: size, borderRadius: size / 2, backgroundColor: 'rgba(226,248,255,0.48)', borderColor: '#68b7d3' }]}>
       <View style={styles.bubbleShine} />
       <View style={styles.waterLine} />
@@ -1725,18 +2923,25 @@ const Bubble = React.memo(function Bubble({
       >
       {visibleContents.map((creatureType, index) => {
         const occurrence = visibleContents.slice(0, index).filter(typeAtIndex => typeAtIndex === creatureType).length;
+        const sharedProps = {
+          type: creatureType,
+          size: miniSize,
+          bubbleSize: size,
+          seed: layoutSeed,
+          index,
+          count: visibleCount,
+        };
         return (
-        <SwimmingPufferfish
-          key={`${layoutSeed}-${creatureType}-${occurrence}`}
-          type={creatureType}
-          size={miniSize}
-          bubbleSize={size}
-          seed={layoutSeed}
-          index={index}
-          count={visibleCount}
-          settleInstantly={settleInstantly}
-          smoothLayout={smoothLayout}
-        />
+          settleInstantly && !smoothLayout
+            ? <RestingPufferfish key={`${layoutSeed}-${creatureType}-${occurrence}`} {...sharedProps} />
+            : (
+              <SwimmingPufferfish
+                key={`${layoutSeed}-${creatureType}-${occurrence}`}
+                {...sharedProps}
+                settleInstantly={settleInstantly}
+                smoothLayout={smoothLayout}
+              />
+            )
         );
       })}
       </Animated.View>
@@ -1888,7 +3093,7 @@ const GamePiece = React.memo(function GamePiece({ piece, exiting }: { piece: Pie
       pointerEvents="none"
       style={[styles.piece, { width: piece.size, height: piece.size, transform: piece.position.getTranslateTransform() }]}
     >
-      <Animated.View style={[styles.elasticBody, { width: piece.size, height: piece.size, transform: [{ scaleX: piece.elastic.x }, { scaleY: piece.elastic.y }] }]}> 
+      <View style={[styles.elasticBody, { width: piece.size, height: piece.size }]}>
       <Animated.View
         style={[
           styles.pieceBody,
@@ -1904,11 +3109,11 @@ const GamePiece = React.memo(function GamePiece({ piece, exiting }: { piece: Pie
             { scale: fusion.interpolate({
               inputRange: mergeSource ? [0, 0.68, 0.82, 0.92, 1] : [0, 1],
               outputRange: mergeSource
-                ? [1, 1, 1.035, 0.88, 0.06]
+                ? [1, 1, 1, 0.88, 0.06]
                 : [piece.mergeStartScale ?? 1, 1],
             }) },
-            { scaleX: landing.interpolate({ inputRange: [0, 0.5, 0.78, 1], outputRange: piece.merging ? [1, 1, 1, 1] : [0.94, 0.975, 1.035, 1] }) },
-            { scaleY: landing.interpolate({ inputRange: [0, 0.5, 0.78, 1], outputRange: piece.merging ? [1, 1, 1, 1] : [1.075, 1.035, 0.975, 1] }) },
+            { scaleX: landing.interpolate({ inputRange: [0, 0.5, 0.78, 1], outputRange: piece.merging ? [1, 1, 1, 1] : [0.985, 0.992, 1, 1] }) },
+            { scaleY: landing.interpolate({ inputRange: [0, 0.5, 0.78, 1], outputRange: piece.merging ? [1, 1, 1, 1] : [1, 0.995, 0.99, 1] }) },
             { scale: squash },
           ],
           },
@@ -2072,13 +3277,13 @@ const GamePiece = React.memo(function GamePiece({ piece, exiting }: { piece: Pie
           count={piece.mergeReceiver ? piece.displayContents?.length ?? piece.count : piece.count}
           contents={piece.mergeReceiver ? piece.displayContents ?? piece.contents : piece.contents}
           size={piece.size}
-          dents={piece.dents}
           layoutSeed={piece.id}
           creatureMotion={piece.creatureMotion}
           creatureRoll={piece.creatureRoll}
           settleInstantly={Boolean(piece.settleCreaturesInstantly || piece.sleeping || piece.merging)}
           smoothLayout={Boolean(piece.merging)}
           layoutCount={piece.mergeReceiver ? finalVisibleCount : undefined}
+          power={piece.power}
         />
       </Animated.View>
       </Animated.View>
@@ -2116,7 +3321,7 @@ const GamePiece = React.memo(function GamePiece({ piece, exiting }: { piece: Pie
         </Animated.View>
         );
       })}
-      </Animated.View>
+      </View>
     </Animated.View>
   );
 });
@@ -2532,7 +3737,7 @@ function LevelCard({ level, order, language, locked, completed, current, onPress
             <Text style={styles.levelStateLabel}>
               {level.tutorial
                 ? language === 'tr' ? `ALIŞTIRMA ${level.tutorial}/3` : `PRACTICE ${level.tutorial}/3`
-                : locked ? copy.locked : completed ? copy.completedLevel : current ? copy.currentLevel : copy.currentLevel}
+                : locked ? copy.locked : completed ? copy.completedLevel : current ? copy.currentLevel : copy.available}
             </Text>
           </View>
         </View>
@@ -2552,10 +3757,12 @@ function LevelCard({ level, order, language, locked, completed, current, onPress
   );
 }
 
-function LevelSelect({ unlocked, language, onSelect, onHome, onSettings }: { unlocked: number; language: Language; onSelect: (index: number) => void; onHome: () => void; onSettings: () => void }) {
+function LevelSelect({ unlocked, activeLevelIndex, language, onSelect, onHome, onSettings }: { unlocked: number; activeLevelIndex: number; language: Language; onSelect: (index: number) => void; onHome: () => void; onSettings: () => void }) {
   const copy = UI[language];
   const pageCount = Math.ceil(LEVELS.length / LEVELS_PER_PAGE);
-  const [page, setPage] = useState(Math.min(pageCount - 1, Math.floor((Math.max(1, unlocked) - 1) / LEVELS_PER_PAGE)));
+  const activePage = Math.min(pageCount - 1, Math.max(0, Math.floor(activeLevelIndex / LEVELS_PER_PAGE)));
+  const [page, setPage] = useState(activePage);
+  useEffect(() => setPage(activePage), [activePage]);
   const pageLevels = LEVELS.slice(page * LEVELS_PER_PAGE, (page + 1) * LEVELS_PER_PAGE);
   const dotStart = Math.max(0, Math.min(pageCount - 5, page - 2));
   const visiblePages = Array.from({ length: Math.min(5, pageCount) }, (_, index) => dotStart + index);
@@ -2583,9 +3790,11 @@ function LevelSelect({ unlocked, language, onSelect, onHome, onSettings }: { unl
       <ScrollView style={styles.levelScroll} showsVerticalScrollIndicator={false} contentContainerStyle={styles.levelGrid}>
         {pageLevels.map((level, order) => {
           const index = level.id - 1;
-          const locked = level.id > unlocked;
-          const completed = level.id < unlocked;
-          const current = level.id === unlocked;
+          // Keep completion progress independent from availability: every level
+          // can be opened while completed/current badges still reflect the save.
+          const locked = !ALL_LEVELS_OPEN && level.id > unlocked;
+          const current = index === activeLevelIndex;
+          const completed = level.id < unlocked && !current;
           return (
             <LevelCard
               key={level.id}
@@ -2606,11 +3815,15 @@ function LevelSelect({ unlocked, language, onSelect, onHome, onSettings }: { unl
 
 function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComplete, onSound, hasNext }: { levelIndex: number; language: Language; onExit: () => void; onHome: () => void; onSettings: () => void; onNext: () => void; onComplete: () => void; onSound: (cue: AudioCue) => void; hasNext: boolean }) {
   const level = LEVELS[levelIndex] as Level;
-  const boardLayout = boardLayoutForLevel(level.id);
+  const boardLayout = useRef(boardLayoutForLevel(level.id)).current;
+  const pilotMission = missionForLevel(level.id, boardLayout);
+  const hasMovingObstacles = boardLayout.obstacles.some(obstacle => Boolean(obstacle.motion));
+  const hasActiveCurrents = boardLayout.currents.length > 0;
+  const hasDynamicBoard = hasMovingObstacles || hasActiveCurrents;
   const copy = UI[language];
   const tutorial = level.tutorial ? TUTORIALS[language][level.tutorial - 1] : undefined;
   const nextColorBagRef = useRef<CreatureType[]>([]);
-  const drawNextBubble = () => {
+  const drawNextBubble = (): NextBubble => {
     if (!nextColorBagRef.current.length) {
       const refill = [...level.palette];
       for (let index = refill.length - 1; index > 0; index -= 1) {
@@ -2619,11 +3832,26 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
       }
       nextColorBagRef.current = refill;
     }
-    return makeNext(level, nextColorBagRef.current.shift() as CreatureType);
+    const bubble = makeNext(level, nextColorBagRef.current.shift() as CreatureType);
+    // Power bubbles are now part of regular play instead of appearing only
+    // after the handful of introductory missions. Their restrained frequency
+    // keeps them exciting without replacing the color-sorting decisions.
+    if (level.id >= 12 && Math.random() < (hasDynamicBoard ? 0.16 : 0.11)) {
+      const power: BubblePower = Math.random() < 0.58 ? 'rainbow' : 'heavy';
+      return { ...bubble, power };
+    }
+    return bubble;
   };
   const [pieces, setPieces] = useState<Piece[]>(() => makeSeed(level));
   const [next, setNext] = useState<NextBubble>(drawNextBubble);
   const [previewNext, setPreviewNext] = useState<NextBubble>(drawNextBubble);
+  const missionProgressRef = useRef(0);
+  const [missionProgress, setMissionProgress] = useState(0);
+  const [missionComplete, setMissionComplete] = useState(false);
+  const vortexMissionVisitsRef = useRef(new Set<string>());
+  const feverChargeRef = useRef(0);
+  const [feverCharge, setFeverCharge] = useState(0);
+  const [feverActive, setFeverActive] = useState(false);
   const [score, setScore] = useState(0);
   const [combo, setCombo] = useState(0);
   const [exiting, setExiting] = useState<Set<string>>(new Set());
@@ -2631,7 +3859,6 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
   const [state, setState] = useState<GameState>('playing');
   const [message, setMessage] = useState<string>(tutorial?.hint ?? copy.drop);
   const [tutorialVisible, setTutorialVisible] = useState(Boolean(tutorial));
-  const [isAiming, setIsAiming] = useState(false);
   const [launcherVisible, setLauncherVisible] = useState(true);
   const aimX = useRef(new Animated.Value(BOARD_WIDTH / 2)).current;
   const aimXRef = useRef(BOARD_WIDTH / 2);
@@ -2658,6 +3885,14 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
   const winScheduledRef = useRef(false);
   const winSettleAttemptsRef = useRef(0);
   const lossScheduledRef = useRef(false);
+  const obstacleTimeRef = useRef(0);
+  const obstacleVisualsRef = useRef(new Map<string, ObstacleVisualState>());
+  const obstacleImpactCooldownRef = useRef(new Map<string, number>());
+  const obstacleBreakCooldownRef = useRef(new Map<string, number>());
+  const obstacleHitCountsRef = useRef(new Map<string, number>());
+  const brokenObstacleIdsRef = useRef(new Set<string>());
+  const [brokenObstacleIds, setBrokenObstacleIds] = useState<Set<string>>(new Set());
+  const [damagedObstacleIds, setDamagedObstacleIds] = useState<Set<string>>(new Set());
   const [failLineWarning, setFailLineWarning] = useState(false);
   const failLinePulse = useRef(new Animated.Value(0)).current;
   const goalCollectPulse = useRef(new Animated.Value(0)).current;
@@ -2672,6 +3907,137 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
       callback();
     }, delay);
     timersRef.current.push(timer);
+  };
+  const queuePowerReward = (power: BubblePower) => {
+    setPreviewNext(current => ({ ...current, power }));
+  };
+  const advancePilotMission = (amount = 1) => {
+    if (!pilotMission || missionProgressRef.current >= pilotMission.target) return;
+    const nextProgress = Math.min(pilotMission.target, missionProgressRef.current + amount);
+    missionProgressRef.current = nextProgress;
+    setMissionProgress(nextProgress);
+    if (nextProgress < pilotMission.target) return;
+    setMissionComplete(true);
+    queuePowerReward(pilotMission.reward);
+    setMessage(language === 'tr' ? 'Yan görev tamamlandı! Özel balon kazandın.' : 'Side mission complete! Special bubble earned.');
+  };
+  const registerMissionImpacts = (impacts: Set<string>) => {
+    if (!pilotMission?.obstacle || missionComplete) return;
+    impacts.forEach(id => {
+      const obstacle = boardLayout.obstacles.find(item => item.id === id);
+      if (obstacle?.visual === pilotMission.obstacle) advancePilotMission();
+    });
+  };
+  const registerVortexMissionVisits = (board: Piece[], layout: BoardLayout) => {
+    if (pilotMission?.kind !== 'vortex' || missionComplete) return;
+    const vortices = layout.currents.filter(current => current.kind === 'vortex');
+    board.forEach(piece => {
+      if (vortexMissionVisitsRef.current.has(piece.id)) return;
+      const centerX = piece.x + piece.size / 2;
+      const centerY = piece.y + piece.size / 2;
+      const inside = vortices.some(current => {
+        const nx = (centerX - current.cx) / Math.max(1, current.width / 2);
+        const ny = (centerY - current.cy) / Math.max(1, current.height / 2);
+        return nx * nx + ny * ny < 0.72;
+      });
+      if (!inside) return;
+      vortexMissionVisitsRef.current.add(piece.id);
+      advancePilotMission();
+    });
+  };
+  const addFeverCharge = (amount: number) => {
+    const nextCharge = Math.min(4, feverChargeRef.current + amount);
+    feverChargeRef.current = nextCharge;
+    setFeverCharge(nextCharge);
+    if (nextCharge < 4) return;
+    feverChargeRef.current = 0;
+    setFeverCharge(0);
+    setFeverActive(true);
+    queuePowerReward('rainbow');
+    schedule(() => setFeverActive(false), 1500);
+  };
+  const getObstacleVisual = (obstacle: BoardObstacle) => {
+    const existing = obstacleVisualsRef.current.get(obstacle.id);
+    if (existing) return existing;
+    const posed = obstacleAtTime(obstacle, obstacleTimeRef.current);
+    const created: ObstacleVisualState = {
+      offset: new Animated.ValueXY({ x: posed.cx - obstacle.cx, y: posed.cy - obstacle.cy }),
+      rotation: new Animated.Value(obstacleVisualAngleAtTime(obstacle, obstacleTimeRef.current)),
+      reaction: new Animated.Value(1),
+    };
+    obstacleVisualsRef.current.set(obstacle.id, created);
+    return created;
+  };
+  const activeBoardLayoutAtTime = (timeSeconds: number) => {
+    const posed = boardLayoutAtTime(boardLayout, timeSeconds);
+    if (!brokenObstacleIdsRef.current.size) return posed;
+    return {
+      ...posed,
+      obstacles: posed.obstacles.filter(obstacle => !brokenObstacleIdsRef.current.has(obstacle.id)),
+    };
+  };
+  const registerBreakableHits = (impacts: Set<string>) => {
+    const now = Date.now();
+    let changed = false;
+    impacts.forEach(id => {
+      if (brokenObstacleIdsRef.current.has(id)) return;
+      const obstacle = boardLayout.obstacles.find(item => item.id === id);
+      if (!obstacle?.breakHits) return;
+      if (now - (obstacleBreakCooldownRef.current.get(id) ?? 0) < 420) return;
+      obstacleBreakCooldownRef.current.set(id, now);
+      const hits = (obstacleHitCountsRef.current.get(id) ?? 0) + 1;
+      obstacleHitCountsRef.current.set(id, hits);
+      if (hits < obstacle.breakHits) {
+        setDamagedObstacleIds(current => new Set([...current, id]));
+        return;
+      }
+      brokenObstacleIdsRef.current.add(id);
+      setDamagedObstacleIds(current => {
+        const nextDamaged = new Set(current);
+        nextDamaged.delete(id);
+        return nextDamaged;
+      });
+      changed = true;
+    });
+    if (changed) {
+      // Removing support is a topology change. Wake the pile immediately so
+      // bubbles above the broken crate fall into the new space in the same turn.
+      piecesRef.current.forEach(piece => {
+        if (completingRef.current.has(piece.id)) return;
+        piece.sleeping = false;
+        piece.settleFrames = 0;
+        piece.contactFrames = 0;
+      });
+      mergeAuditNeededRef.current = true;
+      setBrokenObstacleIds(new Set(brokenObstacleIdsRef.current));
+    }
+  };
+  const syncObstacleVisuals = (posedLayout: BoardLayout, impacts: Set<string> = new Set()) => {
+    posedLayout.obstacles.forEach(posed => {
+      const base = boardLayout.obstacles.find(obstacle => obstacle.id === posed.id);
+      if (!base) return;
+      const visual = getObstacleVisual(base);
+      visual.offset.setValue({ x: posed.cx - base.cx, y: posed.cy - base.cy });
+      visual.rotation.setValue(obstacleVisualAngleAtTime(base, obstacleTimeRef.current));
+      if (!impacts.has(posed.id)) return;
+      if (base.motion?.type === 'rotate') {
+        // Scaling a rotating capsule changes its visible edge while its physics
+        // edge stays fixed. Keep the spinner rigid; the bubble supplies the hit
+        // reaction and the obstacle continues rotating without a contact shake.
+        visual.reaction.stopAnimation();
+        visual.reaction.setValue(1);
+        return;
+      }
+      const now = Date.now();
+      if (now - (obstacleImpactCooldownRef.current.get(posed.id) ?? 0) < 280) return;
+      obstacleImpactCooldownRef.current.set(posed.id, now);
+      visual.reaction.stopAnimation();
+      visual.reaction.setValue(1);
+      Animated.sequence([
+        Animated.timing(visual.reaction, { toValue: 0.9, duration: 55, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+        Animated.spring(visual.reaction, { toValue: 1, damping: 8, stiffness: 220, mass: 0.55, useNativeDriver: true }),
+      ]).start();
+    });
   };
   const hasCrossedFailLine = (board: Piece[]) => board.some(piece =>
     !completingRef.current.has(piece.id)
@@ -2746,7 +4112,8 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     mergeAuditNeededRef.current = true;
     // Re-evaluate support once whenever a merge or pop removes a bubble. Stable
     // bubbles stay asleep; only pieces above the new gap wake and continue falling.
-    const result = stepPhysics(remaining, boardLayout);
+    const activeLayout = activeBoardLayoutAtTime(obstacleTimeRef.current);
+    const result = stepPhysics(remaining, activeLayout);
     commitPhysicsFrame(result.pieces);
     return result.pieces;
   };
@@ -2759,6 +4126,11 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     pendingAimLocationRef.current = null;
     launchArrival.stopAnimation();
     goalCollectPulse.stopAnimation();
+    obstacleVisualsRef.current.forEach(visual => {
+      visual.offset.stopAnimation();
+      visual.rotation.stopAnimation();
+      visual.reaction.stopAnimation();
+    });
   }, []);
 
   useEffect(() => {
@@ -2819,14 +4191,17 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
       if (state === 'playing' && !mergeAnimationRef.current) {
         let changed = false;
         let stepped = false;
+        let physicsStepped = false;
         const impactColorContactKeys = new Set<string>();
+        const obstacleImpacts = new Set<string>();
+        let activeBoardLayout = activeBoardLayoutAtTime(obstacleTimeRef.current);
         while (accumulator >= fixedStep) {
           const exitingPieces = piecesRef.current.filter(piece => completingRef.current.has(piece.id));
           const activePieces = piecesRef.current.filter(piece => !completingRef.current.has(piece.id));
           // A completely settled board needs no per-frame collision work. This
           // removes thousands of pair checks while the player is aiming and is
           // the main protection against visible hitches on older phones.
-          if (!activePieces.some(piece => !piece.sleeping)) {
+          if (!hasDynamicBoard && !activePieces.some(piece => !piece.sleeping)) {
             accumulator = 0;
             const goalReached = scoreRef.current >= level.goal;
             if (!goalReached && hasCrossedFailLine(activePieces)) {
@@ -2854,18 +4229,56 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
             }
             break;
           }
-          const result = stepPhysics(activePieces, boardLayout);
+          obstacleTimeRef.current += fixedStep / 1000;
+          activeBoardLayout = activeBoardLayoutAtTime(obstacleTimeRef.current);
+          if (hasDynamicBoard && !activePieces.some(piece => !piece.sleeping)) {
+            const movingObstacleNearPile = activePieces.some(piece =>
+              activeBoardLayout.obstacles.some(obstacle =>
+                Boolean(obstacle.motion && obstacleContact(piece, obstacle, 2.5)),
+              ),
+            );
+            const activeCurrentNearPile = activePieces.some(piece => {
+              const force = currentForceForPiece(piece, activeBoardLayout);
+              return Math.hypot(force.x, force.y) > 0.008;
+            });
+            if (!movingObstacleNearPile && !activeCurrentNearPile) {
+              // Keep the obstacle animation at 60 fps, but do not run the full
+              // O(n²) pile solver while every bubble is asleep and the moving
+              // obstacle is nowhere near one of them.
+              stepped = true;
+              accumulator -= fixedStep;
+              continue;
+            }
+          }
+          const result = stepPhysics(activePieces, activeBoardLayout);
           piecesRef.current = [...result.pieces, ...exitingPieces];
           changed = changed || result.structureChanged;
           result.colorContactKeys.forEach(key => impactColorContactKeys.add(key));
+          result.obstacleImpacts.forEach(id => obstacleImpacts.add(id));
           stepped = true;
+          physicsStepped = true;
           accumulator -= fixedStep;
         }
         if (stepped) {
+          registerBreakableHits(obstacleImpacts);
+          registerMissionImpacts(obstacleImpacts);
+          syncObstacleVisuals(activeBoardLayout, obstacleImpacts);
           const activePieces = piecesRef.current.filter(piece => !completingRef.current.has(piece.id));
-          commitPhysicsFrame(activePieces);
+          registerVortexMissionVisits(activePieces, activeBoardLayout);
+          if (physicsStepped) commitPhysicsFrame(activePieces);
           if (changed) setPieces([...piecesRef.current]);
-          const contacts = sortableContacts(activePieces);
+          const goalNeedsAudit = scoreRef.current >= level.goal
+            && completingRef.current.size === 0
+            && !winScheduledRef.current;
+          const shouldScanContacts = playerHasDroppedRef.current
+            && !resolvingRef.current
+            && (
+              impactColorContactKeys.size > 0
+              || mergeAuditNeededRef.current
+              || goalNeedsAudit
+            );
+          const contacts = shouldScanContacts ? sortableContacts(activePieces) : [];
+          if (shouldScanContacts) mergeAuditNeededRef.current = false;
           const contactByKey = new Map(contacts.map(contact => [colorContactKey(contact.a, contact.b), contact]));
           const pieceById = new Map(activePieces.map(piece => [piece.id, piece]));
           impactColorContactKeys.forEach(key => {
@@ -2919,6 +4332,9 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     winScheduledRef.current = false;
     winSettleAttemptsRef.current = 0;
     lossScheduledRef.current = false;
+    obstacleTimeRef.current = 0;
+    obstacleImpactCooldownRef.current.clear();
+    syncObstacleVisuals(activeBoardLayoutAtTime(0));
     setFailLineWarning(false);
     failLinePulse.stopAnimation();
     failLinePulse.setValue(0);
@@ -2944,7 +4360,6 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     if (aimFrameRef.current !== null) cancelAnimationFrame(aimFrameRef.current);
     aimFrameRef.current = null;
     pendingAimLocationRef.current = null;
-    setIsAiming(false);
     aimXRef.current = BOARD_WIDTH / 2;
     aimX.setValue(BOARD_WIDTH / 2);
     heldCreatureMotion.stopAnimation();
@@ -2971,6 +4386,35 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     setCombo(0);
     setMessage(copy.ready);
     busy.current = false;
+  };
+
+  const releaseInputAfterPop = (attempt = 0) => {
+    schedule(() => {
+      if (state !== 'playing' || scoreRef.current >= level.goal) return;
+      const activeBoard = piecesRef.current.filter(piece =>
+        piece.contents.length > 0 && !completingRef.current.has(piece.id),
+      );
+      const completedWaiting = activeBoard.some(piece =>
+        piece.contents.length >= level.merge
+        && piece.contents.every(type => type === piece.contents[0]),
+      );
+      const mergeWaiting = completedWaiting || sortableContacts(activeBoard).length > 0;
+      if (resolvingRef.current || mergeAnimationRef.current || mergeWaiting) {
+        mergeAuditNeededRef.current = true;
+        releaseInputAfterPop(attempt + 1);
+        return;
+      }
+      // Do not make the player wait for the decorative rescue flight. Wait only
+      // for the opened stack to settle, with a short cap for current/obstacle
+      // boards whose pieces can intentionally remain in gentle motion.
+      const stackMoving = activeBoard.some(piece => !piece.sleeping);
+      if (stackMoving && attempt < 16) {
+        releaseInputAfterPop(attempt + 1);
+        return;
+      }
+      busy.current = false;
+      setMessage(copy.ready);
+    }, attempt === 0 ? 90 : 45);
   };
 
   const resolveBoard = (board: Piece[], focusId?: string, chain = 1) => {
@@ -3005,6 +4449,7 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
       }));
       setRescueFlights(current => [...current.filter(flight => !ids.has(flight.id)), ...newFlights]);
       setCombo(chain);
+      addFeverCharge(Math.min(2, completed.length) + (chain > 1 ? 1 : 0));
       setMessage(completed.length > 1
         ? language === 'tr' ? `Pof! ${completed.length} balon aynı anda özgür kaldı!` : `Pop! ${completed.length} bubbles were freed together!`
         : chain > 1 ? language === 'tr' ? `Muhteşem zincir x${chain}!` : `Amazing chain x${chain}!`
@@ -3026,7 +4471,10 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
       // screen is allowed only after every escape animation and chain is over.
       const goalReached = scoreRef.current >= level.goal;
       resolvingRef.current = false;
-      busy.current = goalReached;
+      // Keep input serialized while the newly unsupported stack settles and is
+      // audited for a follow-up chain. The rescue animation may continue above
+      // the board, but another dropped bubble can never enter mid-resolution.
+      busy.current = true;
       pendingDropIdRef.current = undefined;
       activeMergeIdsRef.current.clear();
       forcedColorContactsRef.current.clear();
@@ -3034,7 +4482,7 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
       if (!goalReached && hasCrossedFailLine(awakenedPieces)) {
         showBoundaryFailure(180);
       } else if (!goalReached) {
-        busy.current = false;
+        releaseInputAfterPop();
       }
       schedule(() => {
         const remaining = piecesRef.current.filter(piece => !ids.has(piece.id) && piece.contents.length > 0);
@@ -3094,8 +4542,14 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
       const receiver = plan.receivers.get(piece.id);
       const motion = plan.motions.get(piece.id);
       const nextSize = contents.length ? bubbleSizeForCount(contents.length) : piece.size;
-      const centeredX = piece.x + (piece.size - nextSize) / 2;
-      const centeredY = piece.y + (piece.size - nextSize) / 2;
+      const centered = constrainResizedPieceToArena(
+        piece.x + (piece.size - nextSize) / 2,
+        piece.y + (piece.size - nextSize) / 2,
+        nextSize,
+        boardLayout,
+      );
+      const centeredX = centered.x;
+      const centeredY = centered.y;
       piece.position.setValue({ x: centeredX, y: centeredY });
       piece.elastic.setValue({ x: 1, y: 1 });
       const fullyAbsorbed = contents.length === 0;
@@ -3174,7 +4628,8 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
 
   const alignAimX = (locationX: number) => {
     const diameter = bubbleSizeForCount(next.count);
-    return Math.max(diameter / 2 + BOARD_WALL_INSET, Math.min(BOARD_WIDTH - diameter / 2 - BOARD_WALL_INSET, locationX));
+    const wallInset = wallContactInsetAt(boardLayout, HELD_BUBBLE_TOP + diameter / 2);
+    return Math.max(diameter / 2 + wallInset, Math.min(BOARD_WIDTH - diameter / 2 - wallInset, locationX));
   };
 
   const animateHeldFish = (deltaX: number) => {
@@ -3235,8 +4690,11 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     heldCreatureRoll.setValue(0);
     heldSloshRef.current = { x: 0, y: 0, angle: 0 };
     aimingRef.current = true;
-    dragGrabOffsetRef.current = locationX - aimXRef.current;
-    setIsAiming(true);
+    // Every point on the board is a valid aiming handle. Snap the launcher to
+    // the initial touch instead of preserving its old grab offset, then track
+    // the finger one-to-one until release.
+    dragGrabOffsetRef.current = 0;
+    applyAim(locationX, false);
     setMessage(copy.aiming);
   };
 
@@ -3247,7 +4705,6 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     pendingAimLocationRef.current = null;
     aimingRef.current = false;
     dragGrabOffsetRef.current = 0;
-    setIsAiming(false);
     heldCreatureMotion.stopAnimation();
     heldCreatureRoll.stopAnimation();
     heldCreatureMotion.setValue({ x: 0, y: 0 });
@@ -3262,9 +4719,10 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     playerHasDroppedRef.current = true;
     mergeAuditNeededRef.current = true;
     const diameter = bubbleSizeForCount(next.count);
+    const wallInset = wallContactInsetAt(boardLayout, HELD_BUBBLE_TOP + diameter / 2);
     const alignedX = Math.max(
-      diameter / 2 + BOARD_WALL_INSET,
-      Math.min(BOARD_WIDTH - diameter / 2 - BOARD_WALL_INSET, locationX),
+      diameter / 2 + wallInset,
+      Math.min(BOARD_WIDTH - diameter / 2 - wallInset, locationX),
     );
     aimXRef.current = alignedX;
     aimX.setValue(alignedX);
@@ -3299,6 +4757,7 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
       type: next.type,
       count: next.count,
       contents: [...next.contents],
+      power: next.power,
       fresh: true,
       settleCreaturesInstantly: true,
       sleeping: false,
@@ -3337,27 +4796,18 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     heldSloshRef.current = { x: 0, y: 0, angle: 0 };
     const resolveWhenLanded = (attempt = 0) => {
       schedule(() => {
-        if (resolvingRef.current) {
-          if (attempt < 120) resolveWhenLanded(attempt + 1);
-          return;
-        }
+        // The physics loop may detect a same-color impact before this watcher.
+        // Once it owns the drop, retire this timer permanently; reviving it
+        // after the merge animation caused a duplicate resolution pass/hitch.
+        if (resolvingRef.current || pendingDropIdRef.current !== newPiece.id) return;
         const dropped = piecesRef.current.find(piece => piece.id === newPiece.id);
         const floor = dropped ? floorTopForPiece(dropped, boardLayout) : 0;
         const landed = !dropped
           || dropped.sleeping
           || (dropped.contactFrames ?? 0) >= 2
           || floor - dropped.y <= 1.5;
-        if (!landed && attempt < 42) {
-          resolveWhenLanded(attempt + 1);
-          return;
-        }
         if (!landed) {
-          // The falling bubble remains fully simulated and its first matching
-          // contact is still detected by the physics loop. Do not hold the next
-          // launcher hostage while it traverses a tall empty board.
-          pendingDropIdRef.current = undefined;
-          busy.current = false;
-          setMessage(copy.ready);
+          resolveWhenLanded(attempt + 1);
           return;
         }
         resolvingRef.current = true;
@@ -3376,7 +4826,6 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
     flushAim(locationX);
     aimingRef.current = false;
     dragGrabOffsetRef.current = 0;
-    setIsAiming(false);
     dropAt(aimXRef.current);
   };
 
@@ -3386,6 +4835,14 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
   const arrivalOffsetX = previewCenterX - aimXRef.current;
   const remainingRescueCount = Math.max(0, level.goal - score);
   const floorAngle = Math.atan2(boardLayout.floorSlope, BOARD_WIDTH) * 180 / Math.PI;
+  const failLineInset = sideWallInsetAt(boardLayout, FAIL_LINE_Y);
+  const arenaFrameStyle = boardLayout.arenaShape === 'round'
+    ? styles.boardShellSquare
+    : boardLayout.arenaShape === 'drop'
+      ? styles.boardShellDrop
+      : boardLayout.arenaShape === 'cave'
+        ? styles.boardShellCave
+        : styles.boardShellSquare;
 
   return (
     <View style={styles.gamePage}>
@@ -3428,6 +4885,29 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
           <Image source={PUFFERFISH_ASSETS.aqua} resizeMode="contain" style={styles.goalFishIcon} />
           <Text style={styles.goalRemainingCount}>{remainingRescueCount}</Text>
         </Animated.View>
+        {pilotMission && (
+          <View style={[styles.pilotMissionCard, missionComplete && styles.pilotMissionCardComplete]}>
+            <Text numberOfLines={1} style={styles.pilotMissionText}>
+              {missionComplete ? (language === 'tr' ? 'ÖDÜL HAZIR!' : 'REWARD READY!') : (language === 'tr' ? pilotMission.tr : pilotMission.en)}
+            </Text>
+            <View style={styles.pilotMissionTrack}>
+              <View
+                style={[
+                  styles.pilotMissionFill,
+                  { width: `${Math.round(Math.min(1, missionProgress / pilotMission.target) * 100)}%` },
+                ]}
+              />
+            </View>
+          </View>
+        )}
+        <View style={[styles.feverCard, feverActive && styles.feverCardActive]}>
+          <Text style={styles.feverLabel}>{feverActive ? (language === 'tr' ? 'COŞKU!' : 'FEVER!') : 'KOMBO'}</Text>
+          <View style={styles.feverPips}>
+            {Array.from({ length: 4 }, (_, index) => (
+              <View key={index} style={[styles.feverPip, index < feverCharge && styles.feverPipActive]} />
+            ))}
+          </View>
+        </View>
       </View>
 
       <View style={styles.launchArea}>
@@ -3455,12 +4935,13 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
             size={previewDiameter}
             layoutSeed={previewNext.id}
             settleInstantly
+            power={previewNext.power}
           />
         </Animated.View>
       </View>
 
       <View
-        style={[styles.boardShell, { backgroundColor: boardLayout.water }]}
+        style={[styles.boardShell, arenaFrameStyle, { backgroundColor: boardLayout.water }]}
         onLayout={event => {
           const layout = event.nativeEvent.layout;
           boardOriginRef.current = { x: layout.x, y: layout.y };
@@ -3473,7 +4954,7 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
         <View style={[styles.boardLightRay, styles.boardLightRayOne]} pointerEvents="none" />
         <View style={[styles.boardLightRay, styles.boardLightRayTwo]} pointerEvents="none" />
         <View style={[styles.boardLightRay, styles.boardLightRayThree]} pointerEvents="none" />
-        <View style={styles.boardInnerRim} pointerEvents="none" />
+        {boardLayout.arenaShape !== 'round' && <View style={[styles.boardInnerRim, arenaFrameStyle]} pointerEvents="none" />}
         <View style={[styles.boardAmbientBubble, styles.boardAmbientBubbleOne]} pointerEvents="none" />
         <View style={[styles.boardAmbientBubble, styles.boardAmbientBubbleTwo]} pointerEvents="none" />
         <View style={[styles.boardAmbientBubble, styles.boardAmbientBubbleThree]} pointerEvents="none" />
@@ -3488,10 +4969,70 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
           <View style={[styles.coralBranch, styles.coralBranchCenter]} />
           <View style={[styles.coralBranch, styles.coralBranchRight]} />
         </View>
-        {boardLayout.obstacles.map(obstacle => {
+        {boardLayout.currents.map(current => (
+          <View
+            key={current.id}
+            pointerEvents="none"
+            style={[
+              styles.currentField,
+              current.kind === 'vortex' ? styles.vortexField : styles.streamField,
+              {
+                left: current.cx - current.width / 2,
+                top: current.cy - current.height / 2,
+                width: current.width,
+                height: current.height,
+                borderRadius: Math.min(current.width, current.height) / 2,
+              },
+            ]}
+          >
+            {current.kind === 'stream' ? (
+              <View
+                style={[
+                  styles.currentStreamTracks,
+                  { transform: [{ rotate: `${current.angle ?? 0}deg` }] },
+                ]}
+              >
+                {[0, 1, 2].map(index => (
+                  <View key={`${current.id}-flow-${index}`} style={[styles.currentStreamLine, { top: `${23 + index * 25}%` }]}>
+                    <View style={styles.currentStreamArrow} />
+                  </View>
+                ))}
+              </View>
+            ) : (
+              <>
+                <View style={styles.vortexRingOuter} />
+                <View style={styles.vortexRingInner} />
+                <Text style={styles.vortexArrow}>{current.clockwise ? '↻' : '↺'}</Text>
+                <View style={[styles.vortexPearl, styles.vortexPearlOne]} />
+                <View style={[styles.vortexPearl, styles.vortexPearlTwo]} />
+                <View style={[styles.vortexPearl, styles.vortexPearlThree]} />
+              </>
+            )}
+          </View>
+        ))}
+        {boardLayout.obstacles.filter(obstacle => !brokenObstacleIds.has(obstacle.id)).map(obstacle => {
           const isRoundBumper = Math.abs(obstacle.length - obstacle.thickness) < 0.5;
+          const isBoundary = obstacle.role === 'boundary';
+          const obstacleVisual = getObstacleVisual(obstacle);
+          const obstacleColors = obstacle.visual === 'clam'
+            ? { body: '#efa3b5', edge: '#ffdf9b', tint: 'rgba(255,235,246,0.28)' }
+            : obstacle.visual === 'anchor'
+              ? { body: '#2f6878', edge: '#e5b54b', tint: 'rgba(100,219,229,0.18)' }
+              : obstacle.visual === 'piston'
+                ? { body: '#bd5b51', edge: '#ffd16a', tint: 'rgba(255,128,104,0.2)' }
+                : obstacle.visual === 'wheel'
+                  ? { body: '#087d8c', edge: '#efc65b', tint: 'rgba(73,203,211,0.2)' }
+                  : obstacle.visual === 'flap' || obstacle.visual === 'crate' || obstacle.visual === 'ramp'
+                    ? { body: '#9a5a27', edge: '#efc65b', tint: 'rgba(25,111,112,0.08)' }
+                    : isBoundary
+            ? { body: '#087d8c', edge: '#f1c85b', tint: 'rgba(9,111,122,0.28)' }
+            : obstacle.kind === 'coral'
+              ? { body: '#c95e50', edge: '#713129', tint: 'rgba(255,132,126,0.22)' }
+              : obstacle.kind === 'stone'
+                ? { body: '#426d78', edge: '#223e49', tint: 'rgba(159,220,228,0.18)' }
+                : { body: '#9a5a27', edge: '#5d341d', tint: 'rgba(25,111,112,0.08)' };
           return (
-            <View
+            <Animated.View
               key={obstacle.id}
               pointerEvents="none"
               style={[
@@ -3502,26 +5043,142 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
                   width: obstacle.length,
                   height: obstacle.thickness,
                   borderRadius: obstacle.thickness / 2,
-                  backgroundColor: '#9a5a27',
-                  borderColor: '#5d341d',
-                  transform: [{ rotate: `${obstacle.angle}deg` }],
+                  backgroundColor: obstacleColors.body,
+                  borderColor: obstacleColors.edge,
+                  transform: [
+                    { translateX: obstacleVisual.offset.x },
+                    { translateY: obstacleVisual.offset.y },
+                    {
+                      rotate: obstacleVisual.rotation.interpolate({
+                        inputRange: [-36000, 36000],
+                        outputRange: ['-36000deg', '36000deg'],
+                      }),
+                    },
+                    { scale: obstacleVisual.reaction },
+                  ],
                 },
+                isBoundary && styles.boardBoundaryFeature,
+                obstacle.reaction === 'spring' && styles.boardObstacleReactive,
               ]}
             >
-              <Image source={SHIPWRECK_WOOD_ASSET} resizeMode="cover" style={styles.boardObstacleTexture} />
-              <View style={styles.boardObstacleVarnish} />
+              <Image
+                source={SHIPWRECK_WOOD_ASSET}
+                resizeMode="cover"
+                style={[styles.boardObstacleTexture, { opacity: obstacle.kind === 'stone' ? 0.38 : isBoundary ? 0.62 : 0.86 }]}
+              />
+              <View style={[styles.boardObstacleVarnish, { backgroundColor: obstacleColors.tint }]} />
+              {obstacle.visual === 'ramp' && (
+                <>
+                  <View style={styles.rampChannel} />
+                  <View style={[styles.rampBrace, styles.rampBraceLeft]} />
+                  <View style={[styles.rampBrace, styles.rampBraceRight]} />
+                </>
+              )}
+              {obstacle.visual === 'clam' && (
+                <>
+                  <View style={styles.clamPearl} />
+                  <View style={[styles.clamRib, styles.clamRibOne]} />
+                  <View style={[styles.clamRib, styles.clamRibTwo]} />
+                  <View style={[styles.clamRib, styles.clamRibThree]} />
+                </>
+              )}
+              {obstacle.visual === 'anchor' && (
+                <>
+                  <View style={styles.anchorRing} />
+                  <View style={styles.anchorStem} />
+                  <View style={[styles.anchorHook, styles.anchorHookLeft]} />
+                  <View style={[styles.anchorHook, styles.anchorHookRight]} />
+                </>
+              )}
+              {obstacle.visual === 'piston' && (
+                <>
+                  <View style={styles.pistonShaft} />
+                  <View style={styles.pistonHead} />
+                  <View style={styles.pistonBand} />
+                </>
+              )}
+              {obstacle.visual === 'wheel' && (
+                <>
+                  <View style={styles.wheelPadding} />
+                  <View style={[styles.wheelSpoke, styles.wheelSpokeHorizontal]} />
+                  <View style={[styles.wheelSpoke, styles.wheelSpokeVertical]} />
+                  <View style={[styles.wheelSpoke, styles.wheelSpokeDiagonalOne]} />
+                  <View style={[styles.wheelSpoke, styles.wheelSpokeDiagonalTwo]} />
+                  <View style={styles.wheelHubMark} />
+                </>
+              )}
+              {obstacle.visual === 'flap' && (
+                <>
+                  <View style={styles.flapPanel} />
+                  <View style={[styles.flapHinge, styles.flapHingeLeft]} />
+                  <View style={[styles.flapHinge, styles.flapHingeRight]} />
+                </>
+              )}
+              {obstacle.visual === 'crate' && (
+                <>
+                  <View style={[styles.crateBrace, styles.crateBraceForward]} />
+                  <View style={[styles.crateBrace, styles.crateBraceBackward]} />
+                  <View style={[styles.crateBarnacle, styles.crateBarnacleOne]} />
+                  <View style={[styles.crateBarnacle, styles.crateBarnacleTwo]} />
+                  {damagedObstacleIds.has(obstacle.id) && (
+                    <>
+                      <View style={[styles.crateCrack, styles.crateCrackOne]} />
+                      <View style={[styles.crateCrack, styles.crateCrackTwo]} />
+                    </>
+                  )}
+                </>
+              )}
+              {isBoundary && <View style={styles.boardBoundaryInset} />}
+              {isBoundary && obstacle.length > 70 && <View style={styles.boardBoundaryRopeBand} />}
               <View style={styles.boardObstacleShine} />
               {!isRoundBumper && <View style={[styles.boardObstaclePearl, styles.boardObstaclePearlLeft]} />}
               {!isRoundBumper && <View style={[styles.boardObstaclePearl, styles.boardObstaclePearlRight]} />}
-              {isRoundBumper && <View style={styles.boardObstacleBumperRing} />}
-            </View>
+              {!isRoundBumper && obstacle.length > 70 && <View style={[styles.boardObstaclePearl, styles.boardObstaclePearlCenter]} />}
+              {isRoundBumper && (
+                <>
+                  <View style={styles.boardObstacleBumperRing} />
+                  <View style={[styles.boardObstacleBumperCore, { backgroundColor: obstacleColors.edge }]} />
+                </>
+              )}
+            </Animated.View>
           );
         })}
-        <View style={styles.leftRail} pointerEvents="none"><Image source={CORAL_WRECK_SIDE_ASSET} resizeMode="stretch" style={styles.sideFrameTexture} /></View>
-        <View style={styles.rightRail} pointerEvents="none"><Image source={CORAL_WRECK_SIDE_ASSET} resizeMode="stretch" style={styles.sideFrameTexture} /></View>
+        {boardLayout.arenaShape !== 'square' && boardLayout.arenaShape !== 'round' && Array.from({ length: 32 }, (_, index) => {
+          const sliceHeight = BOARD_HEIGHT / 32 + 1;
+          const centerY = (index + 0.5) * BOARD_HEIGHT / 32;
+          const inset = sideWallInsetAt(boardLayout, centerY);
+          const extension = Math.max(0, inset - BOARD_WALL_INSET);
+          if (extension < 0.5) return null;
+          return (
+            <React.Fragment key={`arena-wall-${index}`}>
+              <View pointerEvents="none" style={[styles.arenaWallExtension, { left: BOARD_WALL_INSET - 1, top: index * BOARD_HEIGHT / 32, width: extension + 2, height: sliceHeight }]} />
+              <View pointerEvents="none" style={[styles.arenaWallExtension, { right: BOARD_WALL_INSET - 1, top: index * BOARD_HEIGHT / 32, width: extension + 2, height: sliceHeight }]} />
+            </React.Fragment>
+          );
+        })}
+        {boardLayout.arenaShape === 'round' && (
+          <>
+            <View pointerEvents="none" style={[styles.roundBottomSideFill, styles.roundBottomSideFillLeft]}>
+              <Image source={CORAL_WRECK_SIDE_ASSET} resizeMode="stretch" style={styles.sideFrameTexture} />
+            </View>
+            <View pointerEvents="none" style={[styles.roundBottomSideFill, styles.roundBottomSideFillRight]}>
+              <Image source={CORAL_WRECK_SIDE_ASSET} resizeMode="stretch" style={styles.sideFrameTexture} />
+            </View>
+            <View pointerEvents="none" style={styles.roundPlayfieldFrameAsset}>
+              <Image source={ROUND_PLAYFIELD_FRAME_ASSET} resizeMode="stretch" style={styles.roundPlayfieldFrameImage} />
+            </View>
+          </>
+        )}
+        {boardLayout.arenaShape !== 'round' && (
+          <>
+            <View style={styles.leftRail} pointerEvents="none"><Image source={CORAL_WRECK_SIDE_ASSET} resizeMode="stretch" style={styles.sideFrameTexture} /></View>
+            <View style={styles.rightRail} pointerEvents="none"><Image source={CORAL_WRECK_SIDE_ASSET} resizeMode="stretch" style={styles.sideFrameTexture} /></View>
+          </>
+        )}
         <Animated.View
           style={[
             styles.failLineGlow,
+            { left: failLineInset, right: failLineInset },
             failLineWarning && styles.failLineGlowWarning,
             failLineWarning && {
               opacity: failLinePulse.interpolate({ inputRange: [0, 1], outputRange: [0.55, 1] }),
@@ -3530,7 +5187,7 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
           ]}
           pointerEvents="none"
         />
-        <View style={styles.dropLimit} pointerEvents="none">
+        <View style={[styles.dropLimit, { left: failLineInset, right: failLineInset }]} pointerEvents="none">
           {Array.from({ length: 8 }, (_, index) => (
             <View key={index} style={[styles.dropLimitDash, failLineWarning && styles.dropLimitDashWarning]} />
           ))}
@@ -3538,14 +5195,8 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
         <View
           testID="drop-area"
           accessibilityRole="button"
-          accessibilityLabel="Balona veya altındaki hizaya dokun, sürükle ve bırak"
-          onStartShouldSetResponder={event => {
-            if (busy.current || state !== 'playing') return false;
-            const { locationX, locationY } = event.nativeEvent;
-            return Math.abs(locationX - aimXRef.current) <= heldDiameter / 2 + 12
-              && locationY >= HELD_BUBBLE_TOP - 12
-              && locationY <= BOARD_HEIGHT + 12;
-          }}
+          accessibilityLabel="Oyun alanında istediğin yere dokun, sürükle ve bırak"
+          onStartShouldSetResponder={() => !busy.current && state === 'playing'}
           onMoveShouldSetResponder={() => false}
           onResponderGrant={event => beginAim(event.nativeEvent.locationX)}
           onResponderMove={event => moveAim(event.nativeEvent.locationX)}
@@ -3564,7 +5215,6 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
                 width: heldDiameter + 8,
                 height: heldDiameter + 8,
                 borderRadius: (heldDiameter + 8) / 2,
-                borderColor: CREATURES[next.type].body,
                 opacity: launcherVisible ? (busy.current ? 0.82 : 1) : 0,
                 transform: [
                   {
@@ -3575,7 +5225,7 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
                   },
                   { translateY: launchArrival.interpolate({ inputRange: [0, 0.76, 1], outputRange: [-90, 5, 0] }) },
                   { rotate: launchArrival.interpolate({ inputRange: [0, 1], outputRange: ['420deg', '0deg'] }) },
-                  { scale: Animated.multiply(launchArrival.interpolate({ inputRange: [0, 0.8, 1], outputRange: [0.62, 1.04, 1] }), isAiming ? 1.045 : 1) },
+                  { scale: launchArrival.interpolate({ inputRange: [0, 0.8, 1], outputRange: [0.62, 0.99, 1] }) },
                 ],
               },
             ]}
@@ -3589,10 +5239,40 @@ function Game({ levelIndex, language, onExit, onHome, onSettings, onNext, onComp
               creatureMotion={heldCreatureMotion}
               creatureRoll={heldCreatureRoll}
               settleInstantly
+              power={next.power}
             />
           </Animated.View>
         )}
         {pieces.map(piece => <GamePiece key={piece.id} piece={piece} exiting={exiting.has(piece.id)} />)}
+        {boardLayout.floorCurve > 0 && Array.from({ length: 24 }, (_, index) => {
+          const visualWallInset = boardLayout.arenaShape === 'round' ? ROUND_PLAYFIELD_INSET : BOARD_WALL_INSET;
+          const usableWidth = BOARD_WIDTH - visualWallInset * 2;
+          const sliceWidth = usableWidth / 24;
+          const left = visualWallInset + index * sliceWidth;
+          const centerX = left + sliceWidth / 2;
+          const curvedSurface = floorSurfaceAt(boardLayout, centerX);
+          const flatSurface = boardLayout.arenaShape === 'round'
+            ? ROUND_FRAME_INNER_BOTTOM_Y
+            : BOARD_HEIGHT - FLOOR_CLEARANCE + boardLayout.floorSlope * ((centerX - BOARD_WIDTH / 2) / BOARD_WIDTH);
+          return (
+            <View
+              key={`floor-bank-${index}`}
+              pointerEvents="none"
+              style={[
+                styles.floorBankSlice,
+                {
+                  left,
+                  top: curvedSurface,
+                  width: sliceWidth + 1,
+                  height: Math.max(4, flatSurface - curvedSurface + 5),
+                  opacity: index % 2 ? 0.96 : 1,
+                },
+              ]}
+            >
+              <View style={styles.floorBankEdge} />
+            </View>
+          );
+        })}
         <View style={[styles.floor, { transform: [{ rotate: `${floorAngle}deg` }] }]} pointerEvents="none">
           <Image source={CORAL_WRECK_SAND_ASSET} resizeMode="cover" style={styles.floorTexture} />
           <View style={styles.floorGlow} />
@@ -3760,10 +5440,12 @@ export default function App() {
   }, [scene]);
 
   useEffect(() => {
-    Promise.all([AsyncStorage.getItem(PROGRESS_KEY), AsyncStorage.getItem(LANGUAGE_KEY), AsyncStorage.getItem(MUSIC_KEY), AsyncStorage.getItem(SFX_KEY)])
-      .then(([progressValue, languageValue, musicValue, soundValue]) => {
+    Promise.all([AsyncStorage.getItem(PROGRESS_KEY), AsyncStorage.getItem(LAST_LEVEL_KEY), AsyncStorage.getItem(LANGUAGE_KEY), AsyncStorage.getItem(MUSIC_KEY), AsyncStorage.getItem(SFX_KEY)])
+      .then(([progressValue, lastLevelValue, languageValue, musicValue, soundValue]) => {
         const saved = Number(progressValue);
+        const savedLevelIndex = Number(lastLevelValue);
         if (Number.isFinite(saved)) setUnlocked(Math.max(1, Math.min(LEVELS.length + 1, saved)));
+        if (Number.isFinite(savedLevelIndex)) setLevelIndex(Math.max(0, Math.min(LEVELS.length - 1, Math.floor(savedLevelIndex))));
         if (languageValue === 'tr' || languageValue === 'en') setLanguage(languageValue);
         if (musicValue === 'true' || musicValue === 'false') setMusicEnabled(musicValue === 'true');
         if (soundValue === 'true' || soundValue === 'false') setSoundEnabled(soundValue === 'true');
@@ -3780,6 +5462,10 @@ export default function App() {
   useEffect(() => {
     if (progressLoaded.current) void AsyncStorage.setItem(PROGRESS_KEY, String(unlocked)).catch(() => undefined);
   }, [unlocked]);
+
+  useEffect(() => {
+    if (preferencesLoaded.current) void AsyncStorage.setItem(LAST_LEVEL_KEY, String(levelIndex)).catch(() => undefined);
+  }, [levelIndex]);
 
   useEffect(() => {
     if (preferencesLoaded.current) void AsyncStorage.setItem(LANGUAGE_KEY, language).catch(() => undefined);
@@ -3834,7 +5520,7 @@ export default function App() {
     scene.stopAnimation();
     Animated.timing(scene, {
       toValue: 0,
-      duration: 120,
+      duration: 90,
       easing: Easing.out(Easing.quad),
       useNativeDriver: true,
       isInteraction: false,
@@ -3852,7 +5538,7 @@ export default function App() {
         const secondFrame = requestAnimationFrame(() => {
           Animated.timing(scene, {
             toValue: 1,
-            duration: 220,
+            duration: 170,
             easing: Easing.out(Easing.cubic),
             useNativeDriver: true,
             isInteraction: false,
@@ -3974,6 +5660,7 @@ export default function App() {
         {screen === 'levels' && (
           <LevelSelect
             unlocked={unlocked}
+            activeLevelIndex={levelIndex}
             language={language}
             onSelect={chooseLevel}
             onHome={() => withTransition(() => setScreen('home'))}
@@ -4136,6 +5823,10 @@ const styles = StyleSheet.create({
   cheekLeft: { left: '19%' },
   cheekRight: { right: '19%' },
   bubbleFrame: { alignItems: 'center', justifyContent: 'center' },
+  powerBubbleHalo: { position: 'absolute', left: -3, right: -3, top: -3, bottom: -3, zIndex: 4, borderWidth: 3, shadowColor: '#8f67ff', shadowOpacity: 0.8, shadowRadius: 8, shadowOffset: { width: 0, height: 0 }, elevation: 6 },
+  powerBubbleCore: { position: 'absolute', right: 2, top: 2, width: 16, height: 16, borderRadius: 8, borderWidth: 2, borderColor: '#fff' },
+  powerBubbleRainbow: { backgroundColor: '#a45cff', shadowColor: '#ff5f8d', shadowOpacity: 0.9, shadowRadius: 5, elevation: 5 },
+  powerBubbleHeavy: { backgroundColor: '#ffad1f', shadowColor: '#ff7b28', shadowOpacity: 0.9, shadowRadius: 5, elevation: 5 },
   bubble: { backgroundColor: 'rgba(242,252,255,0.78)', borderWidth: 2.5, borderColor: '#8ac9df', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' },
   creatureLayer: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0 },
   bubbleShine: { position: 'absolute', left: '17%', top: '11%', width: '24%', height: '12%', borderRadius: 20, backgroundColor: 'rgba(255,255,255,0.9)', transform: [{ rotate: '-28deg' }] },
@@ -4238,12 +5929,27 @@ const styles = StyleSheet.create({
   goalCollectRing: { position: 'absolute', left: 3, top: 2, width: 40, height: 40, borderRadius: 20, borderWidth: 3, borderColor: '#8df1ff', backgroundColor: 'rgba(187,248,255,0.28)', shadowColor: '#68e7ff', shadowOpacity: 0.9, shadowRadius: 10, shadowOffset: { width: 0, height: 0 } },
   goalFishIcon: { width: 42, height: 42, marginRight: 8 },
   goalRemainingCount: { minWidth: 24, color: '#176f99', fontSize: 22, lineHeight: 25, fontWeight: '900', textAlign: 'center' },
+  pilotMissionCard: { flex: 1, height: 41, marginLeft: 6, paddingHorizontal: 10, paddingVertical: 6, borderRadius: 15, backgroundColor: 'rgba(255,255,255,0.94)', borderWidth: 2, borderColor: '#b7e8f3', shadowColor: '#315f78', shadowOpacity: 0.12, shadowRadius: 5, elevation: 3 },
+  pilotMissionCardComplete: { backgroundColor: '#e9fff5', borderColor: '#4bd49b' },
+  pilotMissionText: { color: '#39718c', fontSize: 8.5, lineHeight: 11, fontWeight: '900' },
+  pilotMissionTrack: { height: 7, marginTop: 4, borderRadius: 5, overflow: 'hidden', backgroundColor: '#d9edf3' },
+  pilotMissionFill: { height: '100%', borderRadius: 5, backgroundColor: '#30d08b' },
+  feverCard: { width: 65, height: 41, marginLeft: 5, paddingHorizontal: 7, alignItems: 'center', justifyContent: 'center', borderRadius: 15, backgroundColor: '#e9f1ff', borderWidth: 2, borderColor: '#b8cbf5' },
+  feverCardActive: { backgroundColor: '#fff0c5', borderColor: '#ffad28', shadowColor: '#ff9823', shadowOpacity: 0.45, shadowRadius: 7, elevation: 5 },
+  feverLabel: { color: '#536da7', fontSize: 8, fontWeight: '900', letterSpacing: 0.35 },
+  feverPips: { flexDirection: 'row', marginTop: 4, gap: 2 },
+  feverPip: { width: 8, height: 6, borderRadius: 3, backgroundColor: '#c5d5e8' },
+  feverPipActive: { backgroundColor: '#ff9f24' },
   launchArea: { width: BOARD_WIDTH, height: 29, alignItems: 'center', justifyContent: 'center' },
   nextPreviewDock: { position: 'absolute', zIndex: 12, right: 7, top: -48, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(241,252,255,0.96)', borderWidth: 2.5, shadowColor: '#155f83', shadowOpacity: 0.34, shadowRadius: 10, shadowOffset: { width: 0, height: 6 }, elevation: 11 },
   launchBubbleRing: { position: 'absolute', top: 30, left: BOARD_WIDTH / 2 - 36, width: 72, height: 72, borderRadius: 36, borderWidth: 2, borderStyle: 'dashed', alignItems: 'center', justifyContent: 'center', backgroundColor: '#fff', shadowColor: '#396c87', shadowOpacity: 0.14, shadowRadius: 8, elevation: 4 },
   gameMessage: { color: '#4c7188', fontSize: 10, fontWeight: '700', textAlign: 'center' },
   dropPointerText: { position: 'absolute', left: BOARD_WIDTH / 2 - 7, bottom: 13, color: '#ff6793', fontWeight: '900', fontSize: 24, lineHeight: 20 },
   boardShell: { width: BOARD_WIDTH, height: BOARD_HEIGHT, borderRadius: 29, backgroundColor: '#c9edf7', overflow: 'hidden', borderWidth: 3, borderColor: '#f9feff', shadowColor: '#174e82', shadowOpacity: 0.27, shadowRadius: 18, shadowOffset: { width: 0, height: 9 }, elevation: 8 },
+  boardShellSquare: { borderRadius: 14 },
+  boardShellRound: { borderRadius: BOARD_WIDTH / 2 },
+  boardShellDrop: { borderTopLeftRadius: 86, borderTopRightRadius: 86, borderBottomLeftRadius: 126, borderBottomRightRadius: 126 },
+  boardShellCave: { borderTopLeftRadius: 58, borderTopRightRadius: 58, borderBottomLeftRadius: 25, borderBottomRightRadius: 25 },
   boardWaterBase: { ...StyleSheet.absoluteFill, backgroundColor: '#d8f3fa' },
   boardDepthBandOne: { position: 'absolute', left: '-18%', top: 112, width: '136%', height: 190, borderRadius: 999, backgroundColor: 'rgba(172,226,242,0.1)' },
   boardDepthBandTwo: { position: 'absolute', left: '-25%', bottom: 28, width: '150%', height: 225, borderRadius: 999, backgroundColor: 'rgba(92,196,222,0.09)' },
@@ -4269,13 +5975,75 @@ const styles = StyleSheet.create({
   coralBranchCenter: { left: 22, height: 46, transform: [{ rotate: '2deg' }] },
   coralBranchRight: { left: 38, height: 34, transform: [{ rotate: '24deg' }] },
   boardObstacle: { position: 'absolute', zIndex: 2, borderWidth: 2.5, overflow: 'hidden', shadowColor: '#173f61', shadowOpacity: 0.32, shadowRadius: 6, shadowOffset: { width: 0, height: 4 } },
+  currentField: { position: 'absolute', zIndex: 1, overflow: 'hidden', borderWidth: 1.5 },
+  streamField: { backgroundColor: 'rgba(77,224,242,0.13)', borderColor: 'rgba(202,252,255,0.62)' },
+  vortexField: { alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(91,143,236,0.13)', borderColor: 'rgba(211,230,255,0.66)' },
+  currentStreamTracks: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, alignItems: 'center', justifyContent: 'center' },
+  currentStreamLine: { position: 'absolute', left: '13%', width: '62%', height: 4, borderRadius: 3, backgroundColor: 'rgba(225,254,255,0.62)' },
+  currentStreamArrow: { position: 'absolute', right: -13, top: -5, width: 14, height: 14, borderTopWidth: 4, borderRightWidth: 4, borderColor: 'rgba(225,254,255,0.82)', transform: [{ rotate: '45deg' }] },
+  vortexRingOuter: { position: 'absolute', width: '72%', aspectRatio: 1, borderRadius: 999, borderWidth: 3, borderColor: 'rgba(222,242,255,0.52)' },
+  vortexRingInner: { position: 'absolute', width: '42%', aspectRatio: 1, borderRadius: 999, borderWidth: 2, borderColor: 'rgba(177,225,255,0.66)' },
+  vortexArrow: { color: 'rgba(233,249,255,0.9)', fontSize: 46, lineHeight: 51, fontWeight: '700' },
+  vortexPearl: { position: 'absolute', width: 7, height: 7, borderRadius: 4, backgroundColor: 'rgba(237,253,255,0.92)', borderWidth: 1, borderColor: '#8ddcf0' },
+  vortexPearlOne: { left: '17%', top: '46%' },
+  vortexPearlTwo: { right: '21%', top: '25%' },
+  vortexPearlThree: { right: '26%', bottom: '19%' },
+  boardObstacleReactive: { shadowColor: '#78edff', shadowOpacity: 0.72, shadowRadius: 9, elevation: 5 },
+  boardBoundaryFeature: { zIndex: 5, borderWidth: 3, shadowColor: '#072f44', shadowOpacity: 0.42, shadowRadius: 8, elevation: 4 },
+  boardBoundaryInset: { position: 'absolute', left: 4, right: 4, top: 4, bottom: 4, borderRadius: 999, borderWidth: 1.5, borderColor: 'rgba(255,214,86,0.86)', backgroundColor: 'rgba(0,127,139,0.18)' },
+  boardBoundaryRopeBand: { position: 'absolute', left: '50%', top: -4, bottom: -4, width: 9, marginLeft: -4.5, backgroundColor: '#d8c18e', borderLeftWidth: 2, borderRightWidth: 2, borderColor: '#826743', transform: [{ rotate: '7deg' }] },
   boardObstacleTexture: { ...StyleSheet.absoluteFill, width: undefined, height: undefined },
   boardObstacleVarnish: { ...StyleSheet.absoluteFill, backgroundColor: 'rgba(25,111,112,0.08)' },
   boardObstacleShine: { position: 'absolute', left: 9, right: 9, top: 2, height: 3, borderRadius: 4, backgroundColor: 'rgba(255,244,207,0.58)' },
   boardObstaclePearl: { position: 'absolute', top: '50%', width: 7, height: 7, borderRadius: 4, marginTop: -3.5, backgroundColor: '#e2ab43', borderWidth: 1, borderColor: 'rgba(255,243,183,0.88)' },
   boardObstaclePearlLeft: { left: 13 },
   boardObstaclePearlRight: { right: 13 },
+  boardObstaclePearlCenter: { left: '50%', marginLeft: -3.5 },
   boardObstacleBumperRing: { position: 'absolute', left: 5, right: 5, top: 5, bottom: 5, borderRadius: 999, borderWidth: 2, borderColor: 'rgba(226,171,67,0.82)' },
+  boardObstacleBumperCore: { position: 'absolute', left: '50%', top: '50%', width: 10, height: 10, marginLeft: -5, marginTop: -5, borderRadius: 5, borderWidth: 2, borderColor: 'rgba(255,244,201,0.8)' },
+  rampChannel: { position: 'absolute', left: 8, right: 8, top: 7, bottom: 7, borderRadius: 999, borderWidth: 3, borderColor: '#35aeba', backgroundColor: 'rgba(12,92,102,0.38)' },
+  rampBrace: { position: 'absolute', top: -3, bottom: -3, width: 10, borderLeftWidth: 2, borderRightWidth: 2, borderColor: '#714421', backgroundColor: '#d9bd82' },
+  rampBraceLeft: { left: '24%', transform: [{ rotate: '7deg' }] },
+  rampBraceRight: { right: '24%', transform: [{ rotate: '-7deg' }] },
+  clamPearl: { position: 'absolute', left: '50%', top: '50%', width: 18, height: 18, marginLeft: -9, marginTop: -4, borderRadius: 9, backgroundColor: '#fff8d9', borderWidth: 2, borderColor: '#e6b9c9' },
+  clamRib: { position: 'absolute', left: '50%', top: 5, width: 3, height: '48%', borderRadius: 2, backgroundColor: 'rgba(255,243,224,0.78)', transformOrigin: 'bottom' },
+  clamRibOne: { transform: [{ rotate: '-38deg' }] },
+  clamRibTwo: { transform: [{ rotate: '0deg' }] },
+  clamRibThree: { transform: [{ rotate: '38deg' }] },
+  anchorRing: { position: 'absolute', left: '50%', top: 3, width: 16, height: 16, marginLeft: -8, borderRadius: 8, borderWidth: 4, borderColor: '#f1c65d' },
+  anchorStem: { position: 'absolute', left: '50%', top: 14, bottom: 4, width: 6, marginLeft: -3, borderRadius: 4, backgroundColor: '#f1c65d' },
+  anchorHook: { position: 'absolute', bottom: 4, width: 27, height: 15, borderBottomWidth: 5, borderColor: '#f1c65d' },
+  anchorHookLeft: { left: 12, borderLeftWidth: 5, borderBottomLeftRadius: 14, transform: [{ rotate: '-9deg' }] },
+  anchorHookRight: { right: 12, borderRightWidth: 5, borderBottomRightRadius: 14, transform: [{ rotate: '9deg' }] },
+  pistonShaft: { position: 'absolute', left: 8, right: 18, top: '30%', bottom: '30%', borderRadius: 8, backgroundColor: '#32a6ae', borderWidth: 2, borderColor: '#ffd16a' },
+  pistonHead: { position: 'absolute', right: 3, top: 3, bottom: 3, width: 24, borderRadius: 12, backgroundColor: '#e47a67', borderWidth: 3, borderColor: '#ffe086' },
+  pistonBand: { position: 'absolute', right: 29, top: 2, bottom: 2, width: 9, backgroundColor: '#efbd56', borderLeftWidth: 2, borderRightWidth: 2, borderColor: '#80512b' },
+  wheelPadding: { position: 'absolute', left: 5, right: 5, top: 5, bottom: 5, borderRadius: 999, borderWidth: 3, borderColor: '#f5dc9a', backgroundColor: 'rgba(23,105,112,0.32)' },
+  wheelSpoke: { position: 'absolute', left: '50%', top: '50%', width: '74%', height: 8, marginLeft: '-37%', marginTop: -4, borderRadius: 5, backgroundColor: '#efc65b', borderWidth: 1, borderColor: '#fff0b3' },
+  wheelSpokeHorizontal: { transform: [{ rotate: '0deg' }] },
+  wheelSpokeVertical: { transform: [{ rotate: '90deg' }] },
+  wheelSpokeDiagonalOne: { transform: [{ rotate: '45deg' }] },
+  wheelSpokeDiagonalTwo: { transform: [{ rotate: '-45deg' }] },
+  wheelHubMark: { position: 'absolute', left: '50%', top: '50%', width: 14, height: 14, marginLeft: -7, marginTop: -7, borderRadius: 7, backgroundColor: '#efc65b', borderWidth: 2, borderColor: '#fff0b3' },
+  flapPanel: { position: 'absolute', left: 6, right: 6, top: 5, bottom: 5, borderRadius: 10, borderWidth: 2, borderColor: '#eac15b', backgroundColor: 'rgba(86,47,24,0.38)' },
+  flapHinge: { position: 'absolute', top: '50%', width: 13, height: 13, marginTop: -6.5, borderRadius: 7, backgroundColor: '#f0c55d', borderWidth: 2, borderColor: '#704321' },
+  flapHingeLeft: { left: 10 },
+  flapHingeRight: { right: 10 },
+  crateBrace: { position: 'absolute', left: 8, right: 8, top: '50%', height: 7, marginTop: -3.5, borderRadius: 4, backgroundColor: '#efc45e', borderWidth: 1, borderColor: '#73451f' },
+  crateBraceForward: { transform: [{ rotate: '42deg' }] },
+  crateBraceBackward: { transform: [{ rotate: '-42deg' }] },
+  crateBarnacle: { position: 'absolute', borderRadius: 999, backgroundColor: '#f2d7b2', borderWidth: 2, borderColor: '#a36b61' },
+  crateBarnacleOne: { left: 5, top: 7, width: 14, height: 14 },
+  crateBarnacleTwo: { right: 7, bottom: 5, width: 11, height: 11 },
+  crateCrack: { position: 'absolute', left: '50%', top: '50%', width: 24, height: 3, marginLeft: -12, marginTop: -1.5, borderRadius: 2, backgroundColor: '#4d2718' },
+  crateCrackOne: { transform: [{ rotate: '18deg' }, { translateX: 5 }] },
+  crateCrackTwo: { transform: [{ rotate: '-58deg' }, { translateX: -5 }] },
+  arenaWallExtension: { position: 'absolute', zIndex: 5, backgroundColor: '#087d8c' },
+  roundBottomSideFill: { position: 'absolute', zIndex: 4, bottom: 0, width: Math.ceil(BOARD_WALL_INSET + ROUND_SIDE_FRAME_CLEARANCE), height: Math.ceil(BOARD_HEIGHT - ROUND_FRAME_CURVE_START_Y + 3), overflow: 'hidden', backgroundColor: '#087d8c' },
+  roundBottomSideFillLeft: { left: 0 },
+  roundBottomSideFillRight: { right: 0, transform: [{ scaleX: -1 }] },
+  roundPlayfieldFrameAsset: { position: 'absolute', zIndex: 5, left: -ROUND_FRAME_HORIZONTAL_OVERFLOW, right: -ROUND_FRAME_HORIZONTAL_OVERFLOW, top: ROUND_FRAME_TOP_OFFSET, bottom: -ROUND_FRAME_BOTTOM_EXTENSION, width: undefined, height: undefined },
+  roundPlayfieldFrameImage: { ...StyleSheet.absoluteFill, width: undefined, height: undefined },
   leftRail: { position: 'absolute', zIndex: 6, left: 0, top: 0, bottom: 0, width: BOARD_WALL_INSET, backgroundColor: '#087d8c', borderRightWidth: 1.5, borderRightColor: '#f6c752', shadowColor: '#123c55', shadowOpacity: 0.26, shadowRadius: 5, shadowOffset: { width: 2, height: 0 }, overflow: 'hidden' },
   rightRail: { position: 'absolute', zIndex: 6, right: 0, top: 0, bottom: 0, width: BOARD_WALL_INSET, backgroundColor: '#087d8c', borderRightWidth: 1.5, borderRightColor: '#f6c752', shadowColor: '#123c55', shadowOpacity: 0.26, shadowRadius: 5, shadowOffset: { width: -2, height: 0 }, overflow: 'hidden', transform: [{ scaleX: -1 }] },
   sideFrameTexture: { position: 'absolute', left: -BOARD_WALL_INSET * 2.95, top: 0, bottom: 0, width: BOARD_WALL_INSET * 6.65, height: '100%' },
@@ -4285,10 +6053,12 @@ const styles = StyleSheet.create({
   dropLimitDash: { flex: 1, height: 4, marginHorizontal: 3, borderRadius: 3, backgroundColor: '#ff6689', borderWidth: 0.7, borderColor: 'rgba(255,255,255,0.88)', shadowColor: '#ff376f', shadowOpacity: 0.35, shadowRadius: 3, elevation: 1 },
   dropLimitDashWarning: { height: 5, backgroundColor: '#ff163f', borderColor: '#fff4f6', shadowColor: '#c9002e', shadowOpacity: 0.9, shadowRadius: 7, elevation: 5 },
   freeDropArea: { ...StyleSheet.absoluteFill, zIndex: 1 },
-  heldBubble: { position: 'absolute', left: 0, zIndex: 8, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderStyle: 'dashed', backgroundColor: 'rgba(255,255,255,0.5)', shadowColor: '#245f80', shadowOpacity: 0.24, shadowRadius: 7, shadowOffset: { width: 0, height: 4 }, elevation: 8 },
+  heldBubble: { position: 'absolute', left: 0, zIndex: 8, alignItems: 'center', justifyContent: 'center', backgroundColor: 'transparent' },
   piece: { position: 'absolute', width: BUBBLE_SIZE, height: BUBBLE_SIZE, zIndex: 3 },
   elasticBody: { position: 'absolute', left: 0, top: 0, width: BUBBLE_SIZE, height: BUBBLE_SIZE },
   pieceBody: { position: 'absolute', left: 0, top: 0, width: BUBBLE_SIZE, height: BUBBLE_SIZE },
+  floorBankSlice: { position: 'absolute', zIndex: 1, overflow: 'hidden', backgroundColor: '#e3ca8b', borderTopWidth: 2.5, borderTopColor: '#72bec0' },
+  floorBankEdge: { position: 'absolute', left: 0, right: 0, top: 2, height: 4, backgroundColor: 'rgba(255,244,197,0.56)' },
   floor: { position: 'absolute', bottom: -39, left: -25, right: -25, height: 84, borderRadius: 42, backgroundColor: '#e8cf8f', borderTopWidth: 4, borderColor: '#7ebfc0', overflow: 'hidden' },
   floorTexture: { ...StyleSheet.absoluteFill, width: undefined, height: undefined },
   floorGlow: { position: 'absolute', left: 32, right: 32, top: 7, height: 18, borderRadius: 12, backgroundColor: 'rgba(226,255,248,0.3)' },

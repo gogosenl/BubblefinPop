@@ -8,10 +8,12 @@
     "start:online": "expo start",
     "ios": "expo start --offline --ios",
     "android": "expo start --offline --android",
-    "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "audit:levels": "node scripts/audit-levels.mjs",
-    "audit:audio": "node scripts/audit-audio.mjs"
+    "audit:runtime": "node scripts/verify-runtime.mjs",
+    "audit:audio": "node scripts/audit-audio.mjs",
+    "audit:public": "node scripts/audit-public.mjs",
+    "check": "npm run typecheck && npm run audit:levels && npm run audit:runtime && npm run audit:audio && npm run audit:public"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
@@ -19,10 +21,8 @@
     "expo-asset": "~57.0.18",
     "expo-audio": "~57.0.5",
     "react": "19.2.3",
-    "react-dom": "19.2.3",
     "react-native": "0.86.3",
-    "react-native-safe-area-context": "~5.7.0",
-    "react-native-web": "0.21.2"
+    "react-native-safe-area-context": "~5.7.0"
   },
   "devDependencies": {
     "@types/react": "~19.2.4",
